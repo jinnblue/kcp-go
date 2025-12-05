@@ -30,7 +30,9 @@ import (
 )
 
 // SystemTimedSched is the library level timed-scheduler
-var SystemTimedSched *TimedSched = NewTimedSched(runtime.NumCPU())
+var SystemTimedSched = sync.OnceValue(func() *TimedSched {
+	return NewTimedSched(runtime.NumCPU())
+})
 
 type timedFunc struct {
 	execute func()

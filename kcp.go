@@ -43,10 +43,11 @@ const (
 	IKCP_WND_SND     = 32
 	IKCP_WND_RCV     = 32
 	IKCP_MTU_DEF     = 1400
+	IKCP_FRG_MAX     = 255 // max fragment number in a packet
 	IKCP_ACK_FAST    = 3
 	IKCP_INTERVAL    = 100
 	IKCP_OVERHEAD    = 24
-	IKCP_DEADLINK    = 20
+	IKCP_DEADLINK    = 12 // dead link 5~8s
 	IKCP_THRESH_INIT = 2
 	IKCP_THRESH_MIN  = 2
 	IKCP_PROBE_INIT  = 7000   // 7 secs to probe window size
@@ -83,12 +84,15 @@ const (
 	IKCP_LOG_IN_PUSH
 	IKCP_LOG_IN_WASK
 	IKCP_LOG_IN_WINS
+	IKCP_LOG_READ
+	IKCP_LOG_WRITE
+	IKCP_LOG_DEADLINK
 )
 
 const (
 	IKCP_LOG_OUTPUT_ALL = IKCP_LOG_OUTPUT | IKCP_LOG_OUT_ACK | IKCP_LOG_OUT_PUSH | IKCP_LOG_OUT_WASK | IKCP_LOG_OUT_WINS
 	IKCP_LOG_INPUT_ALL  = IKCP_LOG_INPUT | IKCP_LOG_IN_ACK | IKCP_LOG_IN_PUSH | IKCP_LOG_IN_WASK | IKCP_LOG_IN_WINS
-	IKCP_LOG_ALL        = IKCP_LOG_OUTPUT_ALL | IKCP_LOG_INPUT_ALL | IKCP_LOG_SEND | IKCP_LOG_RECV
+	IKCP_LOG_ALL        = IKCP_LOG_OUTPUT_ALL | IKCP_LOG_INPUT_ALL | IKCP_LOG_SEND | IKCP_LOG_RECV | IKCP_LOG_READ | IKCP_LOG_WRITE | IKCP_LOG_DEADLINK
 )
 
 // monotonic reference time point
@@ -244,8 +248,8 @@ type KCP struct {
 	ts_probe, probe_wait                   uint32
 	dead_link, incr                        uint32
 
-	fastresend     int32
-	nocwnd, stream int32
+	fastresend int32
+	nocwnd     int32
 
 	logmask KCPLogType
 
@@ -279,7 +283,7 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.rcv_wnd = IKCP_WND_RCV
 	kcp.rmt_wnd = IKCP_WND_RCV
 	kcp.mtu = IKCP_MTU_DEF
-	kcp.mss = kcp.mtu - IKCP_OVERHEAD
+	kcp.mss = kcp.mtu - IKCP_OVERHEAD - mirrorCmdSize
 	kcp.buffer = make([]byte, kcp.mtu)
 	kcp.rx_rto = IKCP_RTO_DEF
 	kcp.rx_minrto = IKCP_RTO_MIN
@@ -309,8 +313,86 @@ func (kcp *KCP) recycleSegment(seg *segment) {
 	}
 }
 
+// PeekMessage checks the count and size of next message in the recv queue
+func (kcp *KCP) PeekMessage() (frg int, size int) {
+	seg, ok := kcp.rcv_queue.Peek()
+	if !ok {
+		return 0, -1
+	}
+
+	if seg.frg == 0 {
+		return 1, len(seg.data)
+	}
+
+	if kcp.rcv_queue.Len() < int(seg.frg+1) {
+		return 0, -1
+	}
+
+	for seg := range kcp.rcv_queue.ForEach {
+		frg++
+		size += len(seg.data)
+		if seg.frg == 0 {
+			break
+		}
+	}
+	return frg, size
+}
+
+// Receive data from kcp state machine
+//
+// Return number of bytes read.
+//
+// Return -1 when there is no readable data.
+//
+// Return -2 if len(buffers) is smaller than kcp.PeekMessage().
+func (kcp *KCP) ShiftRecv(buffers [][]byte) (n int) {
+	var fast_recover bool
+	if kcp.rcv_queue.Len() >= int(kcp.rcv_wnd) {
+		fast_recover = true
+	}
+
+	// merge fragment
+	i := 0
+	for {
+		seg, ok := kcp.rcv_queue.Pop()
+		if !ok {
+			break
+		}
+
+		buffers[i] = seg.data
+		n += len(seg.data)
+		seg.data = nil
+		i++
+		if seg.frg == 0 {
+			kcp.debugLog(IKCP_LOG_RECV, "conv", kcp.conv, "sn", seg.sn, "ts", seg.ts, "datalen", n)
+			break
+		}
+	}
+
+	// move available data from rcv_buf -> rcv_queue
+	for kcp.rcv_buf.Len() > 0 {
+		seg := heap.Pop(kcp.rcv_buf).(segment)
+		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
+			kcp.rcv_queue.Push(seg)
+			kcp.rcv_nxt++
+		} else {
+			// push back segment
+			heap.Push(kcp.rcv_buf, seg)
+			break
+		}
+	}
+
+	// fast recover
+	if kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && fast_recover {
+		// ready to send back IKCP_CMD_WINS in ikcp_flush
+		// tell remote my window size
+		kcp.probe |= IKCP_ASK_TELL
+	}
+	return
+}
+
 // PeekSize checks the size of next message in the recv queue
-func (kcp *KCP) PeekSize() (length int) {
+func (kcp *KCP) PeekSize() (size int) {
 	seg, ok := kcp.rcv_queue.Peek()
 	if !ok {
 		return -1
@@ -325,7 +407,7 @@ func (kcp *KCP) PeekSize() (length int) {
 	}
 
 	for seg := range kcp.rcv_queue.ForEach {
-		length += len(seg.data)
+		size += len(seg.data)
 		if seg.frg == 0 {
 			break
 		}
@@ -367,7 +449,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		n += len(seg.data)
 		kcp.recycleSegment(&seg)
 		if seg.frg == 0 {
-			kcp.debugLog(IKCP_LOG_RECV, "stream", kcp.stream, "conv", kcp.conv, "sn", seg.sn, "ts", seg.ts, "datalen", n)
+			kcp.debugLog(IKCP_LOG_RECV, "conv", kcp.conv, "sn", seg.sn, "ts", seg.ts, "datalen", n)
 			break
 		}
 	}
@@ -395,53 +477,23 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 }
 
 // Send is user/upper level send, returns below zero for error
-func (kcp *KCP) Send(buffer []byte) int {
+func (kcp *KCP) Send(cmd byte, buffer []byte) int {
 	var count int
-	if len(buffer) == 0 {
+	if cmd == 0 && len(buffer) == 0 {
 		return -1
 	}
 
-	kcp.debugLog(IKCP_LOG_SEND, "stream", kcp.stream, "conv", kcp.conv, "datalen", len(buffer))
+	kcp.debugLog(IKCP_LOG_SEND, "conv", kcp.conv, "cmd", cmd, "datalen", len(buffer))
+	// !streaming mode: removed. we never want to send 'hello' and receive 'he' 'll' 'o'. we want to always receive 'hello'.
 
-	// append to previous segment in streaming mode (if possible)
-	if kcp.stream != 0 {
-		if n := kcp.snd_queue.Len(); n > 0 {
-			for seg := range kcp.snd_queue.ForEachReverse {
-				if len(seg.data) < int(kcp.mss) {
-					capacity := int(kcp.mss) - len(seg.data)
-					extend := capacity
-					if len(buffer) < capacity {
-						extend = len(buffer)
-					}
-
-					// grow slice, the underlying cap is guaranteed to
-					// be larger than kcp.mss
-					oldlen := len(seg.data)
-					seg.data = seg.data[:oldlen+extend]
-					copy(seg.data[oldlen:], buffer)
-					buffer = buffer[extend:]
-				}
-				break
-			}
-		}
-
-		if len(buffer) == 0 {
-			return 0
-		}
-	}
-
-	if len(buffer) <= int(kcp.mss) {
-		count = 1
-	} else {
+	if len(buffer) > int(kcp.mss) {
 		count = (len(buffer) + int(kcp.mss) - 1) / int(kcp.mss)
-	}
-
-	if count > 255 {
-		return -2
-	}
-
-	if count == 0 {
+	} else {
 		count = 1
+	}
+
+	if count > IKCP_FRG_MAX {
+		return -2
 	}
 
 	for i := 0; i < count; i++ {
@@ -451,13 +503,16 @@ func (kcp *KCP) Send(buffer []byte) int {
 		} else {
 			size = len(buffer)
 		}
-		seg := kcp.newSegment(size)
-		copy(seg.data, buffer[:size])
-		if kcp.stream == 0 { // message mode
-			seg.frg = uint8(count - i - 1)
-		} else { // stream mode
-			seg.frg = 0
+		cmdsize := 0
+		if i == 0 {
+			cmdsize = 1
 		}
+		seg := kcp.newSegment(size + cmdsize)
+		if i == 0 {
+			seg.data[0] = cmd
+		}
+		copy(seg.data[cmdsize:], buffer[:size])
+		seg.frg = uint8(count - i - 1)
 
 		kcp.snd_queue.Push(seg)
 		buffer = buffer[size:]
@@ -634,7 +689,12 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		data = ikcp_decode32u(data, &una)
 		data = ikcp_decode32u(data, &length)
 
-		kcp.debugLog(IKCP_LOG_INPUT, "conv", conv, "cmd", cmd, "frg", frg, "wnd", wnd, "ts", ts, "sn", sn, "una", una, "len", length, "datalen", len(data))
+		headcmd := byte(cmdKcpOriginal)
+		if len(data) > 0 {
+			headcmd = data[0]
+		}
+		kcp.debugLog(IKCP_LOG_INPUT, "conv", conv, "kcp_cmd", cmd, "frg", frg, "wnd", wnd, "ts", ts, "sn", sn, "una", una,
+			"cmd", headcmd, "len", length, "datalen", len(data))
 
 		if len(data) < int(length) {
 			return -2
@@ -944,10 +1004,11 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				copy(ptr, segment.data)
 				ptr = ptr[len(segment.data):]
 
-				kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", segment.conv, "sn", segment.sn, "una", segment.una, "ts", segment.ts, "xmit", segment.xmit)
+				kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", segment.conv, "sn", segment.sn, "una", segment.una, "ts", segment.ts, "xmit", segment.xmit, "rto", segment.rto, "datalen", len(segment.data))
 
 				if segment.xmit >= kcp.dead_link {
 					kcp.state = 0xFFFFFFFF
+					kcp.debugLog(IKCP_LOG_DEADLINK, "conv", segment.conv, "sn", segment.sn, "ts", segment.ts, "xmit", segment.xmit, "rto", segment.rto)
 				}
 			}
 
@@ -1101,7 +1162,7 @@ func (kcp *KCP) SetMtu(mtu int) int {
 	}
 
 	kcp.mtu = uint32(mtu)
-	kcp.mss = kcp.mtu - IKCP_OVERHEAD
+	kcp.mss = kcp.mtu - IKCP_OVERHEAD - mirrorCmdSize
 	kcp.buffer = buffer
 	return 0
 }

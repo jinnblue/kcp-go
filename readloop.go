@@ -28,39 +28,41 @@ import (
 	"github.com/pkg/errors"
 )
 
-// defaultReadLoop is the standard procedure for reading from a connection
-func (s *UDPSession) defaultReadLoop() {
+// mirrorReadLoop is the procedure for reading from a connection with unity mirror header
+func (s *UDPSession) mirrorReadLoop() {
+	src := ""
 	buf := make([]byte, mtuLimit)
-	var src string
 	for {
-		if n, addr, err := s.conn.ReadFrom(buf); err == nil {
-			if s.isClosed() {
-				return
-			}
-			// make sure the packet is from the same source
-			if src == "" { // set source address
-				src = addr.String()
-			} else if addr.String() != src {
-				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
-				continue
-			}
-			s.packetInput(buf[:n])
-		} else {
+		n, addr, err := s.conn.ReadFrom(buf)
+		if err != nil {
 			s.notifyReadError(errors.WithStack(err))
 			return
 		}
+		if s.isClosed() {
+			return
+		}
+		// make sure the packet is from the same source
+		if src == "" { // set source address
+			src = addr.String()
+		} else if addr.String() != src {
+			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+			continue
+		}
+
+		s.mirrorPacketInput(buf[:n])
 	}
 }
 
-// defaultReadLoop is the standard procedure for reading and accepting connections on a listener
-func (l *Listener) defaultMonitor() {
+// mirrorMonitor is the procedure for reading and accepting connections unity mirror on a listener
+func (l *Listener) mirrorMonitor() {
 	buf := make([]byte, mtuLimit)
 	for {
-		if n, from, err := l.conn.ReadFrom(buf); err == nil {
-			l.packetInput(buf[:n], from)
-		} else {
+		n, from, err := l.conn.ReadFrom(buf)
+		if err != nil {
 			l.notifyReadError(errors.WithStack(err))
 			return
 		}
+
+		l.mirrorPacketInput(buf[:n], from)
 	}
 }

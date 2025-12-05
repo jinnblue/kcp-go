@@ -23,7 +23,7 @@
 package kcp
 
 import (
-	"fmt"
+	"strconv"
 	"sync/atomic"
 )
 
@@ -39,6 +39,7 @@ type Snmp struct {
 	InCsumErrors        uint64 // checksum errors from CRC32
 	KCPInErrors         uint64 // packet iput errors reported from KCP
 	InPkts              uint64 // incoming packets count
+	InUdpPkts           uint64 // incoming UDP packets count
 	OutPkts             uint64 // outgoing packets count
 	InSegs              uint64 // incoming KCP segments
 	OutSegs             uint64 // outgoing KCP segments
@@ -103,35 +104,36 @@ func (s *Snmp) Header() []string {
 func (s *Snmp) ToSlice() []string {
 	snmp := s.Copy()
 	return []string{
-		fmt.Sprint(snmp.BytesSent),
-		fmt.Sprint(snmp.BytesReceived),
-		fmt.Sprint(snmp.MaxConn),
-		fmt.Sprint(snmp.ActiveOpens),
-		fmt.Sprint(snmp.PassiveOpens),
-		fmt.Sprint(snmp.CurrEstab),
-		fmt.Sprint(snmp.InErrs),
-		fmt.Sprint(snmp.InCsumErrors),
-		fmt.Sprint(snmp.KCPInErrors),
-		fmt.Sprint(snmp.InPkts),
-		fmt.Sprint(snmp.OutPkts),
-		fmt.Sprint(snmp.InSegs),
-		fmt.Sprint(snmp.OutSegs),
-		fmt.Sprint(snmp.InBytes),
-		fmt.Sprint(snmp.OutBytes),
-		fmt.Sprint(snmp.RetransSegs),
-		fmt.Sprint(snmp.FastRetransSegs),
-		fmt.Sprint(snmp.EarlyRetransSegs),
-		fmt.Sprint(snmp.LostSegs),
-		fmt.Sprint(snmp.RepeatSegs),
-		fmt.Sprint(snmp.FECFullShardSet),
-		fmt.Sprint(snmp.FECParityShards),
-		fmt.Sprint(snmp.FECErrs),
-		fmt.Sprint(snmp.FECRecovered),
-		fmt.Sprint(snmp.FECShardSet),
-		fmt.Sprint(snmp.FECShardMin),
-		fmt.Sprint(snmp.RingBufferSndQueue),
-		fmt.Sprint(snmp.RingBufferRcvQueue),
-		fmt.Sprint(snmp.RingBufferSndBuffer),
+		strconv.FormatUint(snmp.BytesSent, 10),
+		strconv.FormatUint(snmp.BytesReceived, 10),
+		strconv.FormatUint(snmp.MaxConn, 10),
+		strconv.FormatUint(snmp.ActiveOpens, 10),
+		strconv.FormatUint(snmp.PassiveOpens, 10),
+		strconv.FormatUint(snmp.CurrEstab, 10),
+		strconv.FormatUint(snmp.InErrs, 10),
+		strconv.FormatUint(snmp.InCsumErrors, 10),
+		strconv.FormatUint(snmp.KCPInErrors, 10),
+		strconv.FormatUint(snmp.InPkts, 10),
+		strconv.FormatUint(snmp.InUdpPkts, 10),
+		strconv.FormatUint(snmp.OutPkts, 10),
+		strconv.FormatUint(snmp.InSegs, 10),
+		strconv.FormatUint(snmp.OutSegs, 10),
+		strconv.FormatUint(snmp.InBytes, 10),
+		strconv.FormatUint(snmp.OutBytes, 10),
+		strconv.FormatUint(snmp.RetransSegs, 10),
+		strconv.FormatUint(snmp.FastRetransSegs, 10),
+		strconv.FormatUint(snmp.EarlyRetransSegs, 10),
+		strconv.FormatUint(snmp.LostSegs, 10),
+		strconv.FormatUint(snmp.RepeatSegs, 10),
+		strconv.FormatUint(snmp.FECFullShardSet, 10),
+		strconv.FormatUint(snmp.FECParityShards, 10),
+		strconv.FormatUint(snmp.FECErrs, 10),
+		strconv.FormatUint(snmp.FECRecovered, 10),
+		strconv.FormatUint(snmp.FECShardSet, 10),
+		strconv.FormatUint(snmp.FECShardMin, 10),
+		strconv.FormatUint(snmp.RingBufferSndQueue, 10),
+		strconv.FormatUint(snmp.RingBufferRcvQueue, 10),
+		strconv.FormatUint(snmp.RingBufferSndBuffer, 10),
 	}
 }
 
@@ -148,6 +150,7 @@ func (s *Snmp) Copy() *Snmp {
 	d.InCsumErrors = atomic.LoadUint64(&s.InCsumErrors)
 	d.KCPInErrors = atomic.LoadUint64(&s.KCPInErrors)
 	d.InPkts = atomic.LoadUint64(&s.InPkts)
+	d.InUdpPkts = atomic.LoadUint64(&s.InUdpPkts)
 	d.OutPkts = atomic.LoadUint64(&s.OutPkts)
 	d.InSegs = atomic.LoadUint64(&s.InSegs)
 	d.OutSegs = atomic.LoadUint64(&s.OutSegs)
@@ -182,6 +185,7 @@ func (s *Snmp) Reset() {
 	atomic.StoreUint64(&s.InCsumErrors, 0)
 	atomic.StoreUint64(&s.KCPInErrors, 0)
 	atomic.StoreUint64(&s.InPkts, 0)
+	atomic.StoreUint64(&s.InUdpPkts, 0)
 	atomic.StoreUint64(&s.OutPkts, 0)
 	atomic.StoreUint64(&s.InSegs, 0)
 	atomic.StoreUint64(&s.OutSegs, 0)

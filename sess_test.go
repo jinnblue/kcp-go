@@ -68,13 +68,9 @@ func dialEcho(port int) (*UDPSession, error) {
 		panic(err)
 	}
 
-	sess.SetStreamMode(true)
-	sess.SetStreamMode(false)
-	sess.SetStreamMode(true)
 	sess.SetWindowSize(1024, 1024)
 	sess.SetReadBuffer(16 * 1024 * 1024)
 	sess.SetWriteBuffer(16 * 1024 * 1024)
-	sess.SetStreamMode(true)
 	sess.SetNoDelay(1, 10, 2, 1)
 	sess.SetMtu(1400)
 	sess.SetMtu(1600)
@@ -92,11 +88,9 @@ func dialSink(port int) (*UDPSession, error) {
 		panic(err)
 	}
 
-	sess.SetStreamMode(true)
 	sess.SetWindowSize(1024, 1024)
 	sess.SetReadBuffer(16 * 1024 * 1024)
 	sess.SetWriteBuffer(16 * 1024 * 1024)
-	sess.SetStreamMode(true)
 	sess.SetNoDelay(1, 10, 2, 1)
 	sess.SetMtu(1400)
 	sess.SetACKNoDelay(false)
@@ -212,7 +206,6 @@ func tinyBufferEchoServer(port int) net.Listener {
 ///////////////////////////
 
 func handleEcho(conn *UDPSession) {
-	conn.SetStreamMode(true)
 	conn.SetWindowSize(4096, 4096)
 	conn.SetNoDelay(1, 10, 2, 1)
 	conn.SetDSCP(46)
@@ -232,7 +225,6 @@ func handleEcho(conn *UDPSession) {
 }
 
 func handleSink(conn *UDPSession) {
-	conn.SetStreamMode(true)
 	conn.SetWindowSize(4096, 4096)
 	conn.SetNoDelay(1, 10, 2, 1)
 	conn.SetDSCP(46)
@@ -250,7 +242,6 @@ func handleSink(conn *UDPSession) {
 }
 
 func handleTinyBufferEcho(conn *UDPSession) {
-	conn.SetStreamMode(true)
 	buf := make([]byte, 2)
 	for {
 		n, err := conn.Read(buf)
@@ -327,11 +318,17 @@ func TestSendVector(t *testing.T) {
 	for i := 0; i < N; i++ {
 		v[0] = []byte(fmt.Sprintf("hello%v", i))
 		v[1] = []byte(fmt.Sprintf("world%v", i))
-		msg := fmt.Sprintf("hello%vworld%v", i, i)
 		cli.WriteBuffers(v)
 		if n, err := cli.Read(buf); err == nil {
-			if string(buf[:n]) != msg {
-				t.Error(string(buf[:n]), msg)
+			if string(buf[:n]) != string(v[0]) {
+				t.Error(string(buf[:n]), string(v[0]))
+			}
+		} else {
+			panic(err)
+		}
+		if n, err := cli.Read(buf); err == nil {
+			if string(buf[:n]) != string(v[1]) {
+				t.Error(string(buf[:n]), string(v[1]))
 			}
 		} else {
 			panic(err)
@@ -658,6 +655,8 @@ func TestUDPSessionNonOwnedPacketConn(t *testing.T) {
 	pconn := newClosedFlagPacketConn(c)
 
 	client, err := NewConn2(l.Addr(), nil, 0, 0, pconn)
+	client.SetCookie(1)
+	client.Connect()
 	if err != nil {
 		panic(err)
 	}
@@ -782,11 +781,16 @@ func TestSessionReadAfterClosed(t *testing.T) {
 		<-done
 	}
 
-	c1, err := NewConn3(0, uc.LocalAddr(), nil, 0, 0, us)
+	// client <-> client, must set one cookie
+	c1, err := NewConn3(1, uc.LocalAddr(), nil, 0, 0, us)
+	c1.SetCookie(1)
+	c1.Connect()
 	if err != nil {
 		panic(err)
 	}
-	c2, err := NewConn3(0, us.LocalAddr(), nil, 0, 0, uc)
+	c2, err := NewConn3(1, us.LocalAddr(), nil, 0, 0, uc)
+	c2.SetCookie(1)
+	c2.Connect()
 	if err != nil {
 		panic(err)
 	}
@@ -796,10 +800,14 @@ func TestSessionReadAfterClosed(t *testing.T) {
 	// log.Println("conv id 0 is closed")
 
 	c1, err = NewConn3(4321, uc.LocalAddr(), nil, 0, 0, us)
+	c1.SetCookie(4321)
+	c1.Connect()
 	if err != nil {
 		panic(err)
 	}
 	c2, err = NewConn3(4321, us.LocalAddr(), nil, 0, 0, uc)
+	c2.SetCookie(4321)
+	c2.Connect()
 	if err != nil {
 		panic(err)
 	}

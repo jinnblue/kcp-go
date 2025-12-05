@@ -39,7 +39,7 @@ import (
 func (s *UDPSession) readLoop() {
 	// default version
 	if s.xconn == nil {
-		s.defaultReadLoop()
+		s.mirrorReadLoop()
 		return
 	}
 
@@ -66,7 +66,7 @@ func (s *UDPSession) readLoop() {
 				}
 
 				// source and size has validated
-				s.packetInput(msg.Buffers[0][:msg.N])
+				s.mirrorPacketInput(msg.Buffers[0][:msg.N])
 			}
 		} else {
 			// compatibility issue:
@@ -75,7 +75,7 @@ func (s *UDPSession) readLoop() {
 			if operr, ok := err.(*net.OpError); ok {
 				if se, ok := operr.Err.(*os.SyscallError); ok {
 					if se.Syscall == "recvmmsg" {
-						s.defaultReadLoop()
+						s.mirrorReadLoop()
 						return
 					}
 				}
@@ -102,7 +102,7 @@ func (l *Listener) monitor() {
 
 	// default version
 	if xconn == nil {
-		l.defaultMonitor()
+		l.mirrorMonitor()
 		return
 	}
 
@@ -116,7 +116,7 @@ func (l *Listener) monitor() {
 		if count, err := xconn.ReadBatch(msgs, 0); err == nil {
 			for i := 0; i < count; i++ {
 				msg := &msgs[i]
-				l.packetInput(msg.Buffers[0][:msg.N], msg.Addr)
+				l.mirrorPacketInput(msg.Buffers[0][:msg.N], msg.Addr)
 			}
 		} else {
 			// compatibility issue:
@@ -125,7 +125,7 @@ func (l *Listener) monitor() {
 			if operr, ok := err.(*net.OpError); ok {
 				if se, ok := operr.Err.(*os.SyscallError); ok {
 					if se.Syscall == "recvmmsg" {
-						l.defaultMonitor()
+						l.mirrorMonitor()
 						return
 					}
 				}

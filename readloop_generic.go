@@ -25,9 +25,9 @@
 package kcp
 
 func (s *UDPSession) readLoop() {
-	s.defaultReadLoop()
+	s.mirrorReadLoop()
 }
 
 func (l *Listener) monitor() {
-	l.defaultMonitor()
+	l.mirrorMonitor()
 }

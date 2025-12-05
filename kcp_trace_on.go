@@ -34,6 +34,44 @@ func (kcp *KCP) debugLog(logtype KCPLogType, args ...any) {
 		msg = "[KCP INPUT WASK]"
 	case IKCP_LOG_IN_WINS:
 		msg = "[KCP INPUT WINS]"
+	case IKCP_LOG_READ:
+		msg = "[KCP READ]"
+	case IKCP_LOG_WRITE:
+		msg = "[KCP WRITE]"
+	case IKCP_LOG_DEADLINK:
+		msg = "[KCP DEADLINK]"
 	}
 	kcp.log(msg, args...)
+}
+
+func (l *Listener) debugLog(logtype ListenLogType, args ...any) {
+	if l.logmask&logtype == 0 {
+		return
+	}
+
+	var msg string
+	switch logtype {
+	case LISTEN_LOG_RDP_INPUT:
+		msg = "[KCP LISTEN RDP INPUT]"
+	case LISTEN_LOG_UDP_INPUT:
+		msg = "[KCP LISTEN UDP INPUT]"
+	case LISTEN_LOG_RDP_ORIGN:
+		msg = "[KCP LISTEN RDP ORIGN]"
+	case LISTEN_LOG_RDP_HELLO:
+		msg = "[KCP LISTEN RDP HELLO]"
+	case LISTEN_LOG_RDP_PING:
+		msg = "[KCP LISTEN RDP PING]"
+	case LISTEN_LOG_RDP_DATA:
+		msg = "[KCP LISTEN RDP DATA]"
+	case LISTEN_LOG_UDP_DATA:
+		msg = "[KCP LISTEN UDP DATA]"
+	case LISTEN_LOG_UDP_DISCONNECT:
+		msg = "[KCP LISTEN UDP DISCONNECT]"
+	case LISTEN_LOG_RDP_DROP:
+		msg = "[KCP LISTEN RDP DROP]"
+	case LISTEN_LOG_UDP_DROP:
+		msg = "[KCP LISTEN UDP DROP]"
+	}
+
+	l.log(msg, args...)
 }

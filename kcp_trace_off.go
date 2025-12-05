@@ -4,3 +4,5 @@
 package kcp
 
 func (kcp *KCP) debugLog(logtype KCPLogType, args ...any) {}
+
+func (l *Listener) debugLog(logtype ListenLogType, args ...any) {}
