@@ -95,6 +95,8 @@ const (
 
 	// maximum packet size
 	mtuLimit = 1500
+	// minimum packet size
+	mtuMinLimit = 50
 
 	// accept backlog
 	acceptBacklog = 128
@@ -162,7 +164,7 @@ type (
 		block   BlockCrypt     // block encryption object
 
 		state  atomic.Uint32 // session state
-		cookie uint32        // cookie for verification
+		cookie atomic.Uint32 // cookie for verification
 
 		// kcp receiving is based on packets
 		// recvbufs  turns packets into stream
@@ -184,8 +186,8 @@ type (
 		dup        int          // duplicate udp packets(testing purpose)
 
 		// notifications
+		connectOnce  sync.Once
 		die          chan struct{} // notify current session has Closed
-		dieOnce      sync.Once
 		closed       atomic.Int32
 		chReadEvent  chan struct{} // notify Read() can be called without blocking
 		chWriteEvent chan struct{} // notify Write() can be called without blocking
@@ -291,15 +293,18 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 			bts := defaultBufferPool.Get()[:size+sess.headerSize]
 			// set channel and cookie
 			bts[channelOffset] = channelReliable
-			binary.LittleEndian.PutUint32(bts[cookieOffset:mirrorHeadSize], sess.cookie)
+			binary.LittleEndian.PutUint32(bts[cookieOffset:mirrorHeadSize], sess.cookie.Load())
 			// copy the data to a new buffer, and reserve header space
 			copy(bts[sess.headerSize:], buf)
 
-			// delivery to post processing
+			// delivery to post processing (non-blocking to avoid deadlock under lock)
 			select {
 			case sess.chPostProcessing <- bts:
 			case <-sess.die:
 				return
+			default:
+				// drop and recycle to avoid blocking; KCP will retransmit if needed
+				defaultBufferPool.Put(bts)
 			}
 
 		}
@@ -312,9 +317,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	SystemTimedSched().Put(sess.update, time.Now())
 
 	if sess.l == nil { // it's a client connection
-		if ownConn {
-			sess.Connect()
-		}
+		go sess.readLoop()
 		atomic.AddUint64(&DefaultSnmp.ActiveOpens, 1)
 	} else {
 		atomic.AddUint64(&DefaultSnmp.PassiveOpens, 1)
@@ -329,25 +332,27 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	return sess
 }
 
-func (s *UDPSession) Connect(datas ...[]byte) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *UDPSession) Connect(data ...byte) (err error) {
+	var need bool
+	s.connectOnce.Do(func() {
+		need = true
+	})
 
-	if s.l != nil {
-		return
+	if !need {
+		return nil
 	}
 
-	// send hello for connect
-	var data []byte
-	if len(datas) > 0 {
-		data = datas[0]
+	s.mu.Lock()
+	if s.l != nil {
+		s.mu.Unlock()
+		return nil
 	}
 	s.sendHello(data)
+	s.mu.Unlock()
 
-	// get server hello resp then change state
-	go s.Read(nil)
-
-	go s.readLoop()
+	// wait for server hello response
+	_, err = s.Read(nil)
+	return err
 }
 
 func (s *UDPSession) readFromBuf(b []byte, data []byte) (n int) {
@@ -357,13 +362,13 @@ func (s *UDPSession) readFromBuf(b []byte, data []byte) (n int) {
 		n += x
 		if x < len(data) {
 			s.bufptr = data[x:]
-			s.notifyReadEvent()
 			return n
 		}
 		defaultBufferPool.Put(s.recvbufs[s.bufidx])
 		s.bufidx++
 		if s.bufidx < len(s.recvbufs) {
 			data = s.recvbufs[s.bufidx]
+			s.recvbufs[s.bufidx] = nil
 		} else {
 			return n
 		}
@@ -371,8 +376,8 @@ func (s *UDPSession) readFromBuf(b []byte, data []byte) (n int) {
 	return n
 }
 
-// PeekUdpMessage checks the size of next message in the udp recv queue
-func (s *UDPSession) PeekUdpMessage() (size int) {
+// PeekUdpMessageSize checks the size of next message in the udp recv queue
+func (s *UDPSession) PeekUdpMessageSize() (size int) {
 	d, ok := s.udpRecvQueue.Peek()
 	if !ok {
 		return -1
@@ -416,24 +421,7 @@ RESET_TIMER:
 			return n, nil
 		}
 
-		// first check if we have any data in udp
-		if size := s.PeekUdpMessage(); size > 0 {
-			s.bufidx = 0
-			s.recvbufs = s.recvbufs[:1]
-			s.shiftRecvUdp(s.recvbufs)
-			data := s.mirrorUnreliableInput(s.recvbufs[0])
-			if len(data) > 0 {
-				n = s.readFromBuf(b, data)
-				s.mu.Unlock()
-				atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
-				return n, nil
-			} else {
-				s.bufidx++ // increment bufidx to skip the empty buffer
-				defaultBufferPool.Put(s.recvbufs[0])
-			}
-		}
-
-		// second check if we have data in kcp
+		// first check if we have data in kcp
 		if frg, size := s.kcp.PeekMessage(); size > 0 { // peek data size from kcp
 			s.bufidx = 0
 			s.recvbufs = s.recvbufs[:frg]
@@ -447,6 +435,37 @@ RESET_TIMER:
 			} else {
 				s.bufidx++ // increment bufidx to skip the empty buffer
 				defaultBufferPool.Put(s.recvbufs[0])
+				if b == nil {
+					if s.kcp.PeekSize() > 0 {
+						s.notifyReadEvent()
+					}
+					s.mu.Unlock()
+					return 0, nil
+				}
+			}
+		}
+
+		// second check if we have any data in udp
+		if size := s.PeekUdpMessageSize(); size > 0 {
+			s.bufidx = 0
+			s.recvbufs = s.recvbufs[:1]
+			s.shiftRecvUdp(s.recvbufs)
+			data := s.mirrorUnreliableInput(s.recvbufs[0])
+			if len(data) > 0 {
+				n = s.readFromBuf(b, data)
+				s.mu.Unlock()
+				atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
+				return n, nil
+			} else {
+				s.bufidx++ // increment bufidx to skip the empty buffer
+				defaultBufferPool.Put(s.recvbufs[0])
+				if b == nil {
+					if s.kcp.PeekSize() > 0 {
+						s.notifyReadEvent()
+					}
+					s.mu.Unlock()
+					return 0, nil
+				}
 			}
 		}
 
@@ -477,7 +496,7 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 RESET_TIMER:
 	var timeout *time.Timer
 	var c <-chan time.Time
-	if twd, ok := s.rd.Load().(time.Time); ok && !twd.IsZero() {
+	if twd, ok := s.wd.Load().(time.Time); ok && !twd.IsZero() {
 		timeout = time.NewTimer(time.Until(twd))
 		c = timeout.C
 		defer timeout.Stop()
@@ -509,7 +528,7 @@ RESET_TIMER:
 				s.kcp.Send(cmdReliableData, b)
 				n += len(b)
 			}
-			s.kcp.debugLog(IKCP_LOG_WRITE, "conv", s.kcp.conv, "cookie", s.cookie, "datalen", n)
+			s.kcp.debugLog(IKCP_LOG_WRITE, "conv", s.kcp.conv, "cookie", s.cookie.Load(), "datalen", n)
 
 			waitsnd = s.kcp.WaitSnd()
 			if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
@@ -544,13 +563,20 @@ RESET_TIMER:
 }
 
 func (s *UDPSession) isClosed() bool {
-	return s.closed.Load() != 0
+	select {
+	case <-s.die:
+		return true
+	default:
+		return false
+	}
 }
 
 type ClosedType int32
 
 const (
 	ClosedByLocal ClosedType = iota + 1
+	ClosedByErrState
+	ClosedByDeadLink
 	ClosedByRemote
 )
 
@@ -564,14 +590,15 @@ func (s *UDPSession) closeWithType(ct ClosedType, needlock bool) error {
 		return errors.WithStack(io.ErrClosedPipe)
 	}
 
-	close(s.die)
-	s.state.Store(stateDisconnected)
-	atomic.AddUint64(&DefaultSnmp.CurrEstab, ^uint64(0))
-
 	// try best to send all queued messages especially the data in txqueue
 	s.flushKcp(IKCP_FLUSH_FULL, needlock)
 
 	s.sendDisconnect()
+
+	close(s.die)
+	s.state.Store(stateDisconnected)
+	atomic.AddUint64(&DefaultSnmp.CurrEstab, ^uint64(0))
+
 	if s.handler != nil {
 		s.handler.OnDisconnected(s, ct)
 		s.handler = nil
@@ -640,13 +667,12 @@ func (s *UDPSession) SetWindowSize(sndwnd, rcvwnd int) {
 
 // SetMtu sets the maximum transmission unit(not including UDP header)
 func (s *UDPSession) SetMtu(mtu int) bool {
-	if mtu > mtuLimit {
-		return false
-	}
+	mtu = min(mtu, mtuLimit)
+	mtu -= s.headerSize
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.kcp.SetMtu(mtu)
+	s.kcp.SetMtu(mtu) // kcp mtu is not including udp header
 	return true
 }
 
@@ -780,7 +806,6 @@ func (s *UDPSession) sendHello(data []byte) error {
 // sendPing sends a ping packet to the remote peer
 func (s *UDPSession) sendPing() error {
 	s.kcp.Send(cmdReliablePing, nil)
-	s.kcp.flush(IKCP_FLUSH_FULL)
 	atomic.AddUint64(&DefaultSnmp.BytesSent, 1)
 	return nil
 }
@@ -789,7 +814,7 @@ func (s *UDPSession) sendPing() error {
 func (s *UDPSession) sendDisconnect() error {
 	bts := make([]byte, mirrorPacketSize)
 	bts[channelOffset] = channelUnreliable
-	binary.LittleEndian.PutUint32(bts[cookieOffset:mirrorHeadSize], s.cookie)
+	binary.LittleEndian.PutUint32(bts[cookieOffset:mirrorHeadSize], s.cookie.Load())
 	bts[mirrorHeadSize] = cmdUnreliableDisconnect
 	for i := 0; i < disconnectTimes; i++ {
 		s.conn.WriteTo(bts, s.RemoteAddr())
@@ -874,7 +899,7 @@ func (s *UDPSession) postProcess() {
 				// We need to prepend [ChannelReliable][Cookie].
 				bts := defaultBufferPool.Get()[:mirrorHeadSize+len(ecc[k])]
 				bts[channelOffset] = channelReliable
-				binary.LittleEndian.PutUint32(bts[cookieOffset:mirrorHeadSize], s.cookie)
+				binary.LittleEndian.PutUint32(bts[cookieOffset:mirrorHeadSize], s.cookie.Load())
 				copy(bts[mirrorHeadSize:], ecc[k])
 
 				msg.Buffers = [][]byte{bts}
@@ -891,7 +916,7 @@ func (s *UDPSession) postProcess() {
 					}
 				}
 				s.tx(txqueue)
-				s.kcp.debugLog(IKCP_LOG_OUTPUT, "conv", s.kcp.conv, "cookie", s.cookie, "datalen", bytesToSend)
+				s.kcp.debugLog(IKCP_LOG_OUTPUT, "conv", s.kcp.conv, "cookie", s.cookie.Load(), "datalen", bytesToSend)
 				// recycle
 				for k := range txqueue {
 					defaultBufferPool.Put(txqueue[k].Buffers[0])
@@ -927,7 +952,7 @@ func (s *UDPSession) update() {
 			s.notifyWriteEvent()
 		}
 		if s.kcp.state == 0xFFFFFFFF {
-			s.notifyReadError(errKcpDeadLink)
+			s.closeWithType(ClosedByDeadLink, false)
 		}
 		s.mu.Unlock()
 		// self-synchronized timed scheduling
@@ -940,11 +965,11 @@ func (s *UDPSession) SetCookie(cookie uint32) {
 	if cookie == 0 {
 		binary.Read(rand.Reader, binary.LittleEndian, &cookie)
 	}
-	s.cookie = cookie
+	s.cookie.Store(cookie)
 }
 
 // GetCookie gets cookie of a session
-func (s *UDPSession) GetCookie() uint32 { return s.cookie }
+func (s *UDPSession) GetCookie() uint32 { return s.cookie.Load() }
 
 // GetConv gets conversation id of a session
 func (s *UDPSession) GetConv() uint32 { return s.kcp.conv }
@@ -1009,9 +1034,10 @@ func (s *UDPSession) mirrorPacketInput(data []byte) {
 	if msgCookie == 0 {
 		atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 	}
-	if s.cookie == 0 {
-		s.cookie = msgCookie
-	} else if s.cookie != msgCookie {
+	cookie := s.cookie.Load()
+	if cookie == 0 {
+		s.cookie.Store(msgCookie)
+	} else if cookie != msgCookie {
 		atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 		return
 	}
@@ -1035,7 +1061,7 @@ func (s *UDPSession) mirrorReliableInput(data []byte) []byte {
 
 	cmd := data[cmdOffset]
 	state := s.state.Load()
-	s.kcp.debugLog(IKCP_LOG_READ, "conv", s.kcp.conv, "cookie", s.cookie, "cmd", cmd, "state", state, "datalen", len(data))
+	s.kcp.debugLog(IKCP_LOG_READ, "conv", s.kcp.conv, "cookie", s.cookie.Load(), "cmd", cmd, "state", state, "datalen", len(data))
 	switch state {
 	case stateConnected:
 		if cmd == cmdReliableHello {
@@ -1044,15 +1070,16 @@ func (s *UDPSession) mirrorReliableInput(data []byte) []byte {
 				s.handler.OnConnected(s)
 			}
 			if s.l != nil { // server side
-				// time.Sleep(time.Second)
 				if s.handler == nil { // user not set cookie, auto generate cookie and resp hello
 					s.sendHello(nil)
+					s.notifyWriteEvent()
 				} else { // user set cookie OnConnect hook, need handle hello data and resp hello
 					return data[mirrorCmdSize:]
 				}
 			}
+			s.notifyReadEvent()
 		} else if cmd == cmdReliableData {
-			s.closeWithType(ClosedByLocal, false)
+			s.closeWithType(ClosedByErrState, false)
 		}
 
 	case stateAuthenticated:
@@ -1062,16 +1089,19 @@ func (s *UDPSession) mirrorReliableInput(data []byte) []byte {
 				s.handler.OnPing(s, s.kcp.rx_srtt)
 			}
 			if s.l != nil {
-				s.l.debugLog(LISTEN_LOG_RDP_PING, "addr", s.remote.String(), "conv", s.kcp.conv, "cookie", s.cookie)
+				s.l.debugLog(LISTEN_LOG_RDP_PING, "addr", s.remote.String(), "conv", s.kcp.conv, "cookie", s.cookie.Load())
 			}
 		} else if cmd == cmdReliableData {
 			if s.l != nil {
-				s.l.debugLog(LISTEN_LOG_RDP_DATA, "addr", s.remote.String(), "conv", s.kcp.conv, "cookie", s.cookie, "datalen", len(data[mirrorCmdSize:]))
+				s.l.debugLog(LISTEN_LOG_RDP_DATA, "addr", s.remote.String(), "conv", s.kcp.conv, "cookie", s.cookie.Load(), "datalen", len(data[mirrorCmdSize:]))
 			}
 			return data[mirrorCmdSize:]
 		} else if cmd == cmdReliableHello {
-			s.closeWithType(ClosedByLocal, false)
+			s.closeWithType(ClosedByErrState, false)
 		}
+
+	case stateDisconnected:
+		return data[mirrorCmdSize:]
 	}
 	return nil
 }
@@ -1082,7 +1112,7 @@ func (s *UDPSession) mirrorUnreliableInput(data []byte) []byte {
 	case cmdUnreliableData:
 		return data[mirrorCmdSize:]
 	case cmdUnreliableDisconnect:
-		s.closeWithType(ClosedByRemote, true)
+		s.closeWithType(ClosedByRemote, false)
 	default:
 		atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 	}
@@ -1209,6 +1239,8 @@ func (s *UDPSession) udpPacketInput(data []byte) {
 	s.udpRecvQueue.Push(d)
 	s.mu.Unlock()
 
+	s.notifyReadEvent()
+
 	atomic.AddUint64(&DefaultSnmp.InUdpPkts, 1)
 	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(n))
 }
@@ -1227,7 +1259,7 @@ func (s *UDPSession) kcpHardReset() {
 		s.kcp.snd_queue.Clear()
 		s.kcp.snd_buf.Clear()
 		s.kcp.rcv_queue.Clear()
-		s.kcp.rcv_buf = newSegmentHeap()
+		s.kcp.rcv_buf = newMinheap(int(s.kcp.rcv_wnd))
 		// clear ack list
 		s.kcp.acklist = s.kcp.acklist[:0]
 	}
@@ -1337,8 +1369,8 @@ func (l *Listener) mirrorReliableInput(sess *UDPSession, data []byte, addr net.A
 		"conv", conv, "sn", sn, "cmd", cmd, "convRecovered", convRecovered, "datalen", len(data))
 
 	if sess != nil { // existing connection
-		if msgCookie != sess.cookie {
-			l.debugLog(LISTEN_LOG_RDP_DROP, "addr", addr.String(), "cookie", msgCookie, "sess_cookie", sess.cookie, "conv", conv, "sn", sn, "cmd", cmd, "datalen", len(data))
+		if msgCookie != sess.cookie.Load() {
+			l.debugLog(LISTEN_LOG_RDP_DROP, "addr", addr.String(), "cookie", msgCookie, "sess_cookie", sess.cookie.Load(), "conv", conv, "sn", sn, "cmd", cmd, "datalen", len(data))
 			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 			return
 		}
@@ -1381,8 +1413,8 @@ func (l *Listener) mirrorUnreliableInput(sess *UDPSession, data []byte, addr net
 	if sess.state.Load() != stateAuthenticated {
 		return
 	}
-	if msgCookie != sess.cookie {
-		l.debugLog(LISTEN_LOG_UDP_DROP, "addr", addr.String(), "cookie", msgCookie, "sess_cookie", sess.cookie, "conv", sess.kcp.conv, "cmd", cmd, "datalen", len(data))
+	if msgCookie != sess.cookie.Load() {
+		l.debugLog(LISTEN_LOG_UDP_DROP, "addr", addr.String(), "cookie", msgCookie, "sess_cookie", sess.cookie.Load(), "conv", sess.kcp.conv, "cmd", cmd, "datalen", len(data))
 		atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 		return
 	}
@@ -1565,16 +1597,21 @@ func (l *Listener) Control(f func(conn net.PacketConn) error) error {
 }
 
 // closeSession notify the listener that a session has closed
-func (l *Listener) closeSession(remote net.Addr) (ret bool) {
+func (l *Listener) closeSession(remote net.Addr) bool {
+	addr := remote.String()
+
 	l.sessionLock.Lock()
-	defer l.sessionLock.Unlock()
-	if sess, ok := l.sessions[remote.String()]; ok {
+	sess, ok := l.sessions[addr]
+	if ok {
+		delete(l.sessions, addr)
+		l.sessionLock.Unlock() // unlock then notify handler to avoid deadlock
 		if l.handler != nil {
 			l.handler.OnDisconnect(sess)
 		}
-		delete(l.sessions, remote.String())
 		return true
 	}
+
+	l.sessionLock.Unlock()
 	return false
 }
 

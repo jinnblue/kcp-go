@@ -26,6 +26,7 @@ import (
 	"container/heap"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"sync"
 	"testing"
@@ -98,8 +99,11 @@ func TestLossyConn4(t *testing.T) {
 
 func testlink(t *testing.T, client *lossyconn.LossyConn, server *lossyconn.LossyConn, nodelay, interval, resend, nc int) {
 	t.Log("testing with nodelay parameters:", nodelay, interval, resend, nc)
-	sess, _ := NewConn2(server.LocalAddr(), nil, 0, 0, client)
 	listener, _ := ServeConn(nil, 0, 0, server)
+	listener.SetDSCP(46)
+	listener.SetReadBuffer(16 * 1024 * 1024)
+	listener.SetWriteBuffer(16 * 1024 * 1024)
+
 	echoServer := func(l *Listener) {
 		for {
 			conn, err := l.AcceptKCP()
@@ -107,7 +111,11 @@ func testlink(t *testing.T, client *lossyconn.LossyConn, server *lossyconn.Lossy
 				return
 			}
 			go func() {
+				conn.SetWriteDelay(true)
 				conn.SetNoDelay(nodelay, interval, resend, nc)
+				conn.SetMtu(1200)
+				conn.SetWindowSize(256, 256)
+				conn.SetACKNoDelay(true)
 				buf := make([]byte, 65536)
 				for {
 					n, err := conn.Read(buf)
@@ -119,7 +127,10 @@ func testlink(t *testing.T, client *lossyconn.LossyConn, server *lossyconn.Lossy
 			}()
 		}
 	}
+	go echoServer(listener)
 
+	sess, _ := NewConn2(server.LocalAddr(), nil, 0, 0, client)
+	sess.Connect()
 	echoTester := func(s *UDPSession, raddr net.Addr) {
 		s.SetNoDelay(nodelay, interval, resend, nc)
 		buf := make([]byte, 64)
@@ -137,7 +148,6 @@ func testlink(t *testing.T, client *lossyconn.LossyConn, server *lossyconn.Lossy
 		t.Logf("total time: %v for %v round trip:", rtt, repeat)
 	}
 
-	go echoServer(listener)
 	echoTester(sess, server.LocalAddr())
 }
 
@@ -157,13 +167,56 @@ func BenchmarkFlush(b *testing.B) {
 	}
 }
 
+// segmentHeap is a min-heap of segments, used for receiving segments in order
+type segmentHeap struct {
+	segments []segment
+	marks    map[uint32]struct{} // to avoid duplicates
+}
+
+func newSegmentHeap() *segmentHeap {
+	h := &segmentHeap{
+		marks: make(map[uint32]struct{}),
+	}
+	heap.Init(h)
+	return h
+}
+
+func (h *segmentHeap) Len() int { return len(h.segments) }
+
+func (h *segmentHeap) Less(i, j int) bool {
+	return h.segments[i].sn < h.segments[j].sn
+}
+
+func (h *segmentHeap) Swap(i, j int) { h.segments[i], h.segments[j] = h.segments[j], h.segments[i] }
+func (h *segmentHeap) Push(x any) {
+	seg := x.(segment)
+	h.segments = append(h.segments, seg)
+	h.marks[seg.sn] = struct{}{}
+}
+
+func (h *segmentHeap) Pop() any {
+	n := len(h.segments)
+	x := h.segments[n-1]
+	h.segments = h.segments[0 : n-1]
+	delete(h.marks, x.sn)
+	return x
+}
+
+func (h *segmentHeap) Has(sn uint32) bool {
+	_, exists := h.marks[sn]
+	return exists
+}
+
 // TestSegmentHeap tests the segmentHeap data structure
 func TestSegmentHeap(t *testing.T) {
 	h := newSegmentHeap()
 	segments := []segment{
-		{sn: 1},
-		{sn: 2},
-		{sn: 3},
+		{sn: 1, frg: 0},
+		{sn: 2, frg: 1},
+		{sn: 3, frg: 0},
+		{sn: 4, frg: 2},
+		{sn: 5, frg: 1},
+		{sn: 6, frg: 0},
 	}
 
 	for _, seg := range segments {
@@ -176,11 +229,112 @@ func TestSegmentHeap(t *testing.T) {
 	}
 
 	for i := 0; i < len(segments); i++ {
+		if !h.Has(segments[i].sn) {
+			t.Errorf("expected segment %d not in heap", segments[i].sn)
+		}
 		seg := heap.Pop(h).(segment)
 		if seg.sn != segments[i].sn {
 			t.Errorf("expected seq %d, got %d", segments[i].sn, seg.sn)
 		}
 	}
+}
+
+// TestMinHeap tests the minheap data structure
+func TestMinHeap(t *testing.T) {
+	h := newMinheap(0)
+	segments := []segment{
+		{sn: 1, frg: 0},
+		{sn: 2, frg: 1},
+		{sn: 3, frg: 0},
+		{sn: 4, frg: 2},
+		{sn: 5, frg: 1},
+		{sn: 6, frg: 0},
+	}
+
+	for _, seg := range segments {
+		if !h.Has(seg.sn) {
+			h.Push(seg)
+		}
+		t.Logf("pushed segment with seq %d", seg.sn)
+	}
+
+	if h.Len() != len(segments) {
+		t.Errorf("expected length %d, got %d", len(segments), h.Len())
+	}
+
+	for i := 0; i < len(segments); i++ {
+		if !h.Has(segments[i].sn) {
+			t.Errorf("expected segment %d not in heap", segments[i].sn)
+		}
+		seg := h.Pop()
+		if seg.sn != segments[i].sn {
+			t.Errorf("expected seq %d, got %d", segments[i].sn, seg.sn)
+		}
+	}
+}
+
+func genSegments(wnd int) []segment {
+	segs := make([]segment, 0, wnd)
+	for i := range wnd {
+		segs = append(segs, segment{sn: uint32(i)})
+	}
+	return segs
+}
+
+func BenchmarkSegmentHeap(b *testing.B) {
+	wnd := 1024
+	orders := genSegments(wnd)
+
+	shuffles := make([]segment, wnd)
+	copy(shuffles, orders)
+	rand.Shuffle(len(shuffles), func(i, j int) { shuffles[i], shuffles[j] = shuffles[j], shuffles[i] })
+
+	var seg segment
+	h := newSegmentHeap()
+	for range b.N {
+		for i := range wnd {
+			if !h.Has(shuffles[i].sn) {
+				heap.Push(h, shuffles[i])
+			}
+		}
+		i := 0
+		for h.Len() > 0 {
+			seg = heap.Pop(h).(segment)
+			if seg.sn != orders[i].sn {
+				b.Errorf("expected seq %d, got %d", orders[i].sn, seg.sn)
+			}
+			i++
+		}
+	}
+	b.Log(seg.sn)
+}
+
+func BenchmarkMinheap(b *testing.B) {
+	wnd := 1024
+	orders := genSegments(wnd)
+
+	shuffles := make([]segment, wnd)
+	copy(shuffles, orders)
+	rand.Shuffle(len(shuffles), func(i, j int) { shuffles[i], shuffles[j] = shuffles[j], shuffles[i] })
+
+	var seg segment
+	h := newMinheap(0)
+	for range b.N {
+		for i := range wnd {
+			if !h.Has(shuffles[i].sn) {
+				h.Push(shuffles[i])
+			}
+		}
+		i := 0
+		for h.Len() > 0 {
+			seg = h.Pop()
+			if seg.sn != orders[i].sn {
+				b.Errorf("expected seq %d, got %d", orders[i].sn, seg.sn)
+			}
+			i++
+		}
+	}
+	b.Log(seg.sn)
 }
 
 // BenchmarkDebugLog test DebugLog cost time with build tags debug on/off

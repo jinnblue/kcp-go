@@ -23,7 +23,6 @@
 package kcp
 
 import (
-	"container/heap"
 	"encoding/binary"
 	"sync/atomic"
 	"time"
@@ -50,7 +49,7 @@ const (
 	IKCP_DEADLINK    = 12 // dead link 5~8s
 	IKCP_THRESH_INIT = 2
 	IKCP_THRESH_MIN  = 2
-	IKCP_PROBE_INIT  = 500    // 500ms to probe window size
+	IKCP_PROBE_INIT  = 7000   // 7 secs to probe window size
 	IKCP_PROBE_LIMIT = 120000 // up to 120 secs to probe window
 	IKCP_SN_OFFSET   = 12
 )
@@ -196,43 +195,100 @@ func (seg *segment) encode(ptr []byte) []byte {
 	return ptr
 }
 
-// segmentHeap is a min-heap of segments, used for receiving segments in order
-type segmentHeap struct {
-	segments []segment
-	marks    map[uint32]struct{} // to avoid duplicates
+type minheap struct {
+	elems []segment
+	marks map[uint32]struct{}
 }
 
-func newSegmentHeap() *segmentHeap {
-	h := &segmentHeap{
-		marks: make(map[uint32]struct{}),
+func newMinheap(size int) (h *minheap) {
+	h = &minheap{
+		elems: make([]segment, 0, size),
+		marks: make(map[uint32]struct{}, size),
 	}
-	heap.Init(h)
 	return h
 }
 
-func (h *segmentHeap) Len() int { return len(h.segments) }
+func (h *minheap) Len() int { return len(h.elems) }
 
-func (h *segmentHeap) Less(i, j int) bool {
-	return _itimediff(h.segments[j].sn, h.segments[i].sn) > 0
+func (h *minheap) Reset() {
+	h.elems = h.elems[:0]
+	clear(h.marks)
 }
 
-func (h *segmentHeap) Swap(i, j int) { h.segments[i], h.segments[j] = h.segments[j], h.segments[i] }
-func (h *segmentHeap) Push(x any) {
-	h.segments = append(h.segments, x.(segment))
-	h.marks[x.(segment).sn] = struct{}{}
+func (h *minheap) Has(sn uint32) (ok bool) {
+	_, ok = h.marks[sn]
+	return ok
 }
 
-func (h *segmentHeap) Pop() any {
-	n := len(h.segments)
-	x := h.segments[n-1]
-	h.segments = h.segments[0 : n-1]
-	delete(h.marks, x.sn)
-	return x
+func (h *minheap) Push(seg segment) {
+	// 1. add new segment to the end of the slice
+	h.elems = append(h.elems, seg)
+
+	// 2. Percolate up operation, maintain a min-heap
+	elems := h.elems
+	i := uint(len(elems) - 1) // Index of new elements
+	for i > 0 {
+		parent := (i - 1) / 2 // Index of parent node
+		// If current node is root (i=0), or its sn is not less than parent, stop
+		if elems[i].sn >= elems[parent].sn {
+			break
+		}
+		// Swap current node and parent node
+		elems[i], elems[parent] = elems[parent], elems[i]
+		// Continue checking up
+		i = parent
+	}
+
+	// 3. Mark the segment as inserted
+	h.marks[seg.sn] = struct{}{}
 }
 
-func (h *segmentHeap) Has(sn uint32) bool {
-	_, exists := h.marks[sn]
-	return exists
+func (h *minheap) Peek() (seg segment) {
+	if len(h.elems) == 0 {
+		return seg
+	}
+	return h.elems[0]
+}
+
+func (h *minheap) Pop() (seg segment) {
+	if len(h.elems) == 0 {
+		return seg
+	}
+
+	// 1. Swap the top segment of the heap with the last segment
+	elems := h.elems
+	size := len(elems) - 1
+	elems[0], elems[size] = elems[size], elems[0]
+
+	// 2. Percolate down operation, maintain a min-heap
+	i := 0
+	for {
+		j := 2*i + 1 // Index of left child node
+		if j >= size {
+			break // If no child node, exit
+		}
+		// Find the child node with higher priority (smaller sn)
+		if j2 := j + 1; j2 < size && elems[j2].sn < elems[j].sn {
+			j = j2
+		}
+		// If current node's sn is not higher than child node, stop
+		if elems[i].sn <= elems[j].sn {
+			break
+		}
+		// Swap current node and child node
+		elems[i], elems[j] = elems[j], elems[i]
+		// Continue checking down
+		i = j
+	}
+
+	// 3. Remove and return the original top segment
+	seg = elems[size]
+	h.elems = elems[:size]
+
+	// 4. Mark the segment as removed
+	delete(h.marks, seg.sn)
+
+	return seg
 }
 
 // KCP defines a single KCP connection
@@ -256,7 +312,7 @@ type KCP struct {
 	snd_queue *RingBuffer[segment]
 	rcv_queue *RingBuffer[segment]
 	snd_buf   *RingBuffer[segment]
-	rcv_buf   *segmentHeap
+	rcv_buf   *minheap
 
 	acklist []ackItem
 
@@ -283,7 +339,7 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.rcv_wnd = IKCP_WND_RCV
 	kcp.rmt_wnd = IKCP_WND_RCV
 	kcp.mtu = IKCP_MTU_DEF
-	kcp.mss = kcp.mtu - IKCP_OVERHEAD - mirrorCmdSize
+	kcp.mss = kcp.mtu - IKCP_OVERHEAD
 	kcp.buffer = make([]byte, kcp.mtu)
 	kcp.rx_rto = IKCP_RTO_DEF
 	kcp.rx_minrto = IKCP_RTO_MIN
@@ -295,7 +351,7 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.snd_buf = NewRingBuffer[segment](IKCP_WND_SND * 2)
 	kcp.rcv_queue = NewRingBuffer[segment](IKCP_WND_RCV * 2)
 	kcp.snd_queue = NewRingBuffer[segment](IKCP_WND_SND * 2)
-	kcp.rcv_buf = newSegmentHeap()
+	kcp.rcv_buf = newMinheap(IKCP_WND_RCV * 2)
 	return kcp
 }
 
@@ -369,18 +425,7 @@ func (kcp *KCP) ShiftRecv(buffers [][]byte) (n int) {
 		}
 	}
 
-	// move available data from rcv_buf -> rcv_queue
-	for kcp.rcv_buf.Len() > 0 {
-		seg := heap.Pop(kcp.rcv_buf).(segment)
-		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
-			kcp.rcv_queue.Push(seg)
-			kcp.rcv_nxt++
-		} else {
-			// push back segment
-			heap.Push(kcp.rcv_buf, seg)
-			break
-		}
-	}
+	kcp.moveRcvBufToQueue()
 
 	// fast recover
 	if kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && fast_recover {
@@ -454,18 +499,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		}
 	}
 
-	// move available data from rcv_buf -> rcv_queue
-	for kcp.rcv_buf.Len() > 0 {
-		seg := heap.Pop(kcp.rcv_buf).(segment)
-		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
-			kcp.rcv_queue.Push(seg)
-			kcp.rcv_nxt++
-		} else {
-			// push back segment
-			heap.Push(kcp.rcv_buf, seg)
-			break
-		}
-	}
+	kcp.moveRcvBufToQueue()
 
 	// fast recover
 	if kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && fast_recover {
@@ -478,18 +512,17 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 
 // Send is user/upper level send, returns below zero for error
 func (kcp *KCP) Send(cmd byte, buffer []byte) int {
-	var count int
-	if cmd == 0 && len(buffer) == 0 {
+	size := len(buffer) + mirrorCmdSize
+	if size == 0 {
 		return -1
 	}
 
 	kcp.debugLog(IKCP_LOG_SEND, "conv", kcp.conv, "cmd", cmd, "datalen", len(buffer))
 	// !streaming mode: removed. we never want to send 'hello' and receive 'he' 'll' 'o'. we want to always receive 'hello'.
 
-	if len(buffer) > int(kcp.mss) {
-		count = (len(buffer) + int(kcp.mss) - 1) / int(kcp.mss)
-	} else {
-		count = 1
+	count := 1
+	if size > int(kcp.mss) {
+		count = (size + int(kcp.mss) - 1) / int(kcp.mss)
 	}
 
 	if count > IKCP_FRG_MAX {
@@ -497,25 +530,23 @@ func (kcp *KCP) Send(cmd byte, buffer []byte) int {
 	}
 
 	for i := 0; i < count; i++ {
-		var size int
-		if len(buffer) > int(kcp.mss) {
+		if size > int(kcp.mss) {
 			size = int(kcp.mss)
-		} else {
-			size = len(buffer)
 		}
-		cmdsize := 0
-		if i == 0 {
-			cmdsize = 1
-		}
-		seg := kcp.newSegment(size + cmdsize)
-		if i == 0 {
-			seg.data[0] = cmd
-		}
-		copy(seg.data[cmdsize:], buffer[:size])
+		seg := kcp.newSegment(size)
 		seg.frg = uint8(count - i - 1)
 
-		kcp.snd_queue.Push(seg)
+		if i == 0 {
+			size--
+			seg.data[cmdOffset] = cmd
+			copy(seg.data[mirrorCmdSize:], buffer[:size])
+		} else {
+			copy(seg.data, buffer[:size])
+		}
 		buffer = buffer[size:]
+		size = len(buffer)
+
+		kcp.snd_queue.Push(seg)
 	}
 	return 0
 }
@@ -624,30 +655,39 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 	}
 
 	repeat := false
-	if !kcp.rcv_buf.Has(sn) {
+	if !kcp.rcv_buf.Has(newseg.sn) {
 		// replicate the content if it's new
 		dataCopy := defaultBufferPool.Get()[:len(newseg.data)]
 		copy(dataCopy, newseg.data)
 		newseg.data = dataCopy
 
-		// insert the new segment into rcv_buf
-		heap.Push(kcp.rcv_buf, newseg)
+		// insert the new segment into rcv_buf use idx from Has to optimize
+		kcp.rcv_buf.Push(newseg)
+	} else {
+		kcp.debugLog(IKCP_LOG_INPUT, "conv", kcp.conv, "sn", sn, "repeat", repeat)
+		repeat = true
 	}
 
 	// move available data from rcv_buf -> rcv_queue
+	kcp.moveRcvBufToQueue()
+
+	return repeat
+}
+
+// moveRcvBufToQueue move available data from rcv_buf -> rcv_queue
+func (kcp *KCP) moveRcvBufToQueue() {
 	for kcp.rcv_buf.Len() > 0 {
-		seg := heap.Pop(kcp.rcv_buf).(segment)
+		// Optimize: use Peek to avoids the costly operation of removing or re-pushing segment.
+		seg := kcp.rcv_buf.Peek()
 		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
+			kcp.rcv_buf.Pop() // When the conditions are met, officially remove the segment.
+
 			kcp.rcv_queue.Push(seg)
 			kcp.rcv_nxt++
 		} else {
-			// push back segment
-			heap.Push(kcp.rcv_buf, seg)
-			break
+			break // Conditions not met exit the loop directly
 		}
 	}
-
-	return repeat
 }
 
 // Input a packet into kcp state machine.
@@ -1152,7 +1192,7 @@ func (kcp *KCP) Check() uint32 {
 
 // SetMtu changes MTU size, default is 1400
 func (kcp *KCP) SetMtu(mtu int) int {
-	if mtu < 50 || mtu < IKCP_OVERHEAD {
+	if mtu < mtuMinLimit || mtu < IKCP_OVERHEAD {
 		return -1
 	}
 
@@ -1162,7 +1202,7 @@ func (kcp *KCP) SetMtu(mtu int) int {
 	}
 
 	kcp.mtu = uint32(mtu)
-	kcp.mss = kcp.mtu - IKCP_OVERHEAD - mirrorCmdSize
+	kcp.mss = kcp.mtu - IKCP_OVERHEAD
 	kcp.buffer = buffer
 	return 0
 }

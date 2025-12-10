@@ -67,19 +67,24 @@ func dialEcho(port int) (*UDPSession, error) {
 	if err != nil {
 		panic(err)
 	}
+	echoClientStart(sess)
+	return sess, err
+}
 
+func echoClientStart(conn net.Conn) {
+	sess := conn.(*UDPSession)
 	sess.SetWindowSize(1024, 1024)
 	sess.SetReadBuffer(16 * 1024 * 1024)
 	sess.SetWriteBuffer(16 * 1024 * 1024)
 	sess.SetNoDelay(1, 10, 2, 1)
-	sess.SetMtu(1400)
-	sess.SetMtu(1600)
-	sess.SetMtu(1400)
-	sess.SetACKNoDelay(true)
+	sess.SetMtu(1200)
 	sess.SetACKNoDelay(false)
-	sess.SetDeadline(time.Now().Add(time.Minute))
 	sess.SetRateLimit(200 * 1024 * 1024)
-	return sess, err
+	sess.SetLogger(IKCP_LOG_ALL, newLoggerWithMilliseconds().Info)
+
+	sess.SetReadDeadline(time.Now().Add(time.Second))
+	sess.Connect()
+	sess.SetDeadline(time.Now().Add(time.Minute))
 }
 
 func dialSink(port int) (*UDPSession, error) {
@@ -95,6 +100,8 @@ func dialSink(port int) (*UDPSession, error) {
 	sess.SetMtu(1400)
 	sess.SetACKNoDelay(false)
 	sess.SetDeadline(time.Now().Add(time.Minute))
+	sess.SetLogger(IKCP_LOG_ALL, newLoggerWithMilliseconds().Info)
+	sess.Connect()
 	return sess, err
 }
 
@@ -108,11 +115,13 @@ func dialTinyBufferEcho(port int) (*UDPSession, error) {
 	if err != nil {
 		panic(err)
 	}
+	sess.SetLogger(IKCP_LOG_ALL, newLoggerWithMilliseconds().Info)
+	sess.Connect()
 	return sess, err
 }
 
 // ////////////////////////
-func listenEcho(port int) (net.Listener, error) {
+func listenEcho(port int) (*Listener, error) {
 	// block, _ := NewNoneBlockCrypt(pass)
 	// block, _ := NewSimpleXORBlockCrypt(pass)
 	// block, _ := NewTEABlockCrypt(pass[:16])
@@ -139,11 +148,15 @@ func echoServer(port int) net.Listener {
 	if err != nil {
 		panic(err)
 	}
+	echoServerStart(l, 64*1024)
+	return l
+}
 
+func echoServerStart(l net.Listener, size int) {
 	go func() {
 		kcplistener := l.(*Listener)
-		kcplistener.SetReadBuffer(4 * 1024 * 1024)
-		kcplistener.SetWriteBuffer(4 * 1024 * 1024)
+		kcplistener.SetReadBuffer(16 * 1024 * 1024)
+		kcplistener.SetWriteBuffer(16 * 1024 * 1024)
 		kcplistener.SetDSCP(46)
 		for {
 			s, err := l.Accept()
@@ -152,13 +165,11 @@ func echoServer(port int) net.Listener {
 			}
 
 			// coverage test
-			s.(*UDPSession).SetReadBuffer(4 * 1024 * 1024)
-			s.(*UDPSession).SetWriteBuffer(4 * 1024 * 1024)
-			go handleEcho(s.(*UDPSession))
+			s.(*UDPSession).SetReadBuffer(16 * 1024 * 1024)
+			s.(*UDPSession).SetWriteBuffer(16 * 1024 * 1024)
+			go handleEcho(s.(*UDPSession), size)
 		}
 	}()
-
-	return l
 }
 
 func sinkServer(port int) net.Listener {
@@ -205,16 +216,21 @@ func tinyBufferEchoServer(port int) net.Listener {
 
 ///////////////////////////
 
-func handleEcho(conn *UDPSession) {
+func handleEcho(conn *UDPSession, size int) {
 	conn.SetWindowSize(4096, 4096)
 	conn.SetNoDelay(1, 10, 2, 1)
 	conn.SetDSCP(46)
-	conn.SetMtu(1400)
+	conn.SetMtu(1200)
 	conn.SetACKNoDelay(false)
 	conn.SetReadDeadline(time.Now().Add(time.Hour))
 	conn.SetWriteDeadline(time.Now().Add(time.Hour))
 	conn.SetRateLimit(200 * 1024 * 1024)
-	buf := make([]byte, 65536)
+	conn.SetWriteDelay(true)
+	conn.SetLogger(IKCP_LOG_ALL, newLoggerWithMilliseconds().Info)
+	if size < 64*1024 {
+		size = 64 * 1024
+	}
+	buf := make([]byte, size)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
@@ -232,6 +248,7 @@ func handleSink(conn *UDPSession) {
 	conn.SetACKNoDelay(false)
 	conn.SetReadDeadline(time.Now().Add(time.Hour))
 	conn.SetWriteDeadline(time.Now().Add(time.Hour))
+	conn.SetLogger(IKCP_LOG_ALL, newLoggerWithMilliseconds().Info)
 	buf := make([]byte, 65536)
 	for {
 		_, err := conn.Read(buf)
@@ -267,9 +284,8 @@ func TestTimeout(t *testing.T) {
 
 	// timeout
 	cli.SetDeadline(time.Now().Add(time.Second))
-	<-time.After(2 * time.Second)
 	n, err := cli.Read(buf)
-	if n != 0 || err == nil {
+	if n != 0 || !errors.Is(err, timeoutError{}) {
 		t.Fail()
 	}
 	cli.Close()
@@ -284,8 +300,10 @@ func TestSendRecv(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
+	defer cli.Close()
 	cli.SetWriteDelay(true)
 	cli.SetDUP(1)
+
 	const N = 100
 	buf := make([]byte, 10)
 	for i := 0; i < N; i++ {
@@ -299,7 +317,34 @@ func TestSendRecv(t *testing.T) {
 			panic(err)
 		}
 	}
-	cli.Close()
+}
+
+func TestSendRecvBig(t *testing.T) {
+	port := int(atomic.AddUint32(&baseport, 1))
+	l := echoServer(port)
+	defer l.Close()
+
+	cli, err := dialEcho(port)
+	if err != nil {
+		panic(err)
+	}
+	defer cli.Close()
+	cli.SetWriteDelay(true)
+
+	const N = 100
+	msg := make([]byte, 4096)
+	buf := make([]byte, 4096)
+	for i := 0; i < N; i++ {
+		io.ReadFull(rand.Reader, msg)
+		cli.Write([]byte(msg))
+		if n, err := io.ReadFull(cli, buf); err == nil {
+			if !bytes.Equal(msg, buf[:n]) {
+				t.Fail()
+			}
+		} else {
+			panic(err)
+		}
+	}
 }
 
 func TestSendVector(t *testing.T) {
@@ -311,7 +356,9 @@ func TestSendVector(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
+	defer cli.Close()
 	cli.SetWriteDelay(false)
+
 	const N = 100
 	buf := make([]byte, 20)
 	v := make([][]byte, 2)
@@ -334,7 +381,6 @@ func TestSendVector(t *testing.T) {
 			panic(err)
 		}
 	}
-	cli.Close()
 }
 
 func TestTinyBufferReceiver(t *testing.T) {
@@ -346,6 +392,8 @@ func TestTinyBufferReceiver(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
+	defer cli.Close()
+
 	const N = 100
 	snd := byte(0)
 	fillBuffer := func(buf []byte) {
@@ -378,7 +426,6 @@ func TestTinyBufferReceiver(t *testing.T) {
 			panic(err)
 		}
 	}
-	cli.Close()
 }
 
 func TestClose(t *testing.T) {
@@ -458,38 +505,53 @@ func parallel_client(wg *sync.WaitGroup, port int) (err error) {
 	return
 }
 
+func BenchmarkEchoSpeed1K(b *testing.B) {
+	speedclient(b, 1024)
+}
+
 func BenchmarkEchoSpeed4K(b *testing.B) {
 	speedclient(b, 4096)
+}
+
+func BenchmarkEchoSpeed16K(b *testing.B) {
+	speedclient(b, 16384)
 }
 
 func BenchmarkEchoSpeed64K(b *testing.B) {
 	speedclient(b, 65536)
 }
 
-func BenchmarkEchoSpeed512K(b *testing.B) {
-	speedclient(b, 524288)
-}
-
-func BenchmarkEchoSpeed1M(b *testing.B) {
-	speedclient(b, 1048576)
+// !note: bench size can't bigger than kcp.mss * 255
+func BenchmarkEchoSpeed256K(b *testing.B) {
+	speedclient(b, 262144)
 }
 
 func speedclient(b *testing.B, nbytes int) {
 	port := int(atomic.AddUint32(&baseport, 1))
-	l := echoServer(port)
-	defer l.Close()
-
-	b.ReportAllocs()
-	cli, err := dialEcho(port)
+	l, err := Listen(fmt.Sprintf("127.0.0.1:%v", port))
 	if err != nil {
 		panic(err)
 	}
+	echoServerStart(l, nbytes)
+	defer l.Close()
 
+	cli, err := Dial(fmt.Sprintf("127.0.0.1:%v", port))
+	if err != nil {
+		panic(err)
+	}
+	echoClientStart(cli)
+	defer cli.Close()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(nbytes))
+	b.ResetTimer()
 	if err := echo_tester(cli, nbytes, b.N); err != nil {
 		b.Fail()
 	}
-	b.SetBytes(int64(nbytes))
-	cli.Close()
+}
+
+func BenchmarkSinkSpeed1K(b *testing.B) {
+	sinkclient(b, 1200)
 }
 
 func BenchmarkSinkSpeed4K(b *testing.B) {
@@ -501,11 +563,7 @@ func BenchmarkSinkSpeed64K(b *testing.B) {
 }
 
 func BenchmarkSinkSpeed256K(b *testing.B) {
-	sinkclient(b, 524288)
-}
-
-func BenchmarkSinkSpeed1M(b *testing.B) {
-	sinkclient(b, 1048576)
+	sinkclient(b, 262144)
 }
 
 func sinkclient(b *testing.B, nbytes int) {
@@ -518,15 +576,18 @@ func sinkclient(b *testing.B, nbytes int) {
 	if err != nil {
 		panic(err)
 	}
+	defer cli.Close()
 
 	sink_tester(cli, nbytes, b.N)
 	b.SetBytes(int64(nbytes))
-	cli.Close()
 }
 
 func echo_tester(cli net.Conn, msglen, msgcount int) error {
+	var msg []byte
 	go func() {
 		buf := make([]byte, msglen)
+		io.ReadFull(rand.Reader, buf)
+		msg = buf
 		for i := 0; i < msgcount; i++ {
 			// send packet
 			if _, err := cli.Write(buf); err != nil {
@@ -548,6 +609,9 @@ func echo_tester(cli net.Conn, msglen, msgcount int) error {
 				break
 			}
 		}
+	}
+	if !bytes.Equal(msg, buf) {
+		return errors.New("echo tester failed: data mismatch")
 	}
 	return nil
 }
@@ -655,7 +719,6 @@ func TestUDPSessionNonOwnedPacketConn(t *testing.T) {
 	pconn := newClosedFlagPacketConn(c)
 
 	client, err := NewConn2(l.Addr(), nil, 0, 0, pconn)
-	client.SetCookie(1)
 	client.Connect()
 	if err != nil {
 		panic(err)
@@ -686,14 +749,15 @@ func TestReliability(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
+	defer cli.Close()
 	cli.SetWriteDelay(false)
+
 	const N = 100000
 	buf := make([]byte, 128)
 	msg := make([]byte, 128)
-
 	for i := 0; i < N; i++ {
 		io.ReadFull(rand.Reader, msg)
-		cli.Write([]byte(msg))
+		cli.Write(msg)
 		if n, err := io.ReadFull(cli, buf); err == nil {
 			if !bytes.Equal(buf[:n], msg) {
 				t.Fail()
@@ -702,7 +766,6 @@ func TestReliability(t *testing.T) {
 			panic(err)
 		}
 	}
-	cli.Close()
 }
 
 func TestControl(t *testing.T) {
@@ -784,7 +847,7 @@ func TestSessionReadAfterClosed(t *testing.T) {
 	// client <-> client, must set one cookie
 	c1, err := NewConn3(1, uc.LocalAddr(), nil, 0, 0, us)
 	c1.SetCookie(1)
-	c1.Connect()
+	go c1.Connect()
 	if err != nil {
 		panic(err)
 	}
@@ -801,7 +864,7 @@ func TestSessionReadAfterClosed(t *testing.T) {
 
 	c1, err = NewConn3(4321, uc.LocalAddr(), nil, 0, 0, us)
 	c1.SetCookie(4321)
-	c1.Connect()
+	go c1.Connect()
 	if err != nil {
 		panic(err)
 	}
