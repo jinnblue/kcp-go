@@ -38,7 +38,7 @@ func TestFECEncodeConsecutive(t *testing.T) {
 	t.Logf("dataSize:%v, paritySize:%v", dataSize, paritySize)
 	group := 0
 	sent := 0
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if i%dataSize == 0 {
 			group++
 		}
@@ -58,16 +58,21 @@ func TestFECEncodeConsecutive(t *testing.T) {
 				expected := uint32((group-1)*(dataSize+paritySize) + dataSize + idx)
 				if seqid != expected {
 					t.Fatalf("expected parity shard:%v actual seqid %v", expected, seqid)
+					return
 				}
 			}
-		} else if sent%dataSize == 0 {
+			continue
+		}
+
+		if sent%dataSize == 0 {
 			t.Log("no parity:", len(ps))
+			continue
 		}
 	}
 }
 
 func TestFECDecodeLoss(t *testing.T) {
-	// This function lose 2 random packet from 10 datashards and 3 parity shards.
+	// This function lose 3 random packet from 10 datashards and 3 parity shards.
 	// so each group of 13 packets should be able to recover from the loss.
 	const dataShards = 10
 	const parityShards = 3
@@ -76,18 +81,20 @@ func TestFECDecodeLoss(t *testing.T) {
 	decoder := newFECDecoder(dataShards, parityShards)
 	t.Logf("dataSize:%v, paritySize:%v", dataShards, parityShards)
 	sent := 0
-	recovered := 0
-	parityLost := 0
+	totalRecovered := 0
+	totalParityLost := 0
 
-	for group := 0; group < 100; group++ {
+	for group := range 100 {
 		losses := make(map[int]bool)
 
 		lost := 0
+		parityLost := 0
 		for lost < parityShards {
 			pos := rand.Intn(dataShards + parityShards)
 			if !losses[pos] {
 				losses[pos] = true
 				if pos >= dataShards {
+					totalParityLost++
 					parityLost++
 				}
 				lost++
@@ -96,9 +103,11 @@ func TestFECDecodeLoss(t *testing.T) {
 
 		if len(losses) != parityShards {
 			t.Fatalf("Expected %v losses, got %v", parityShards, len(losses))
+			return
 		}
 
-		for i := 0; i < dataShards+parityShards; i++ {
+		recovered := 0
+		for i := range dataShards + parityShards {
 			sent++
 			if losses[i] {
 				t.Logf("Lost packet %v in group %v", groupSize*group+i, group)
@@ -115,13 +124,19 @@ func TestFECDecodeLoss(t *testing.T) {
 
 			rec := decoder.decode(pkt)
 			if len(rec) > 0 {
+				totalRecovered += len(rec)
 				recovered += len(rec)
 				t.Log("Recovered", len(rec), "packets from group", group)
 			}
 		}
+
+		// the recovered packets should equal to the lost data packets
+		if recovered != lost-parityLost {
+			t.Fatalf("Expected recovered %v packets, got %v", lost-parityLost, recovered)
+		}
 	}
-	t.Log("Total recovered packets:", recovered)
-	t.Log("Total parity lost:", parityLost)
+	t.Log("Total recovered packets:", totalRecovered)
+	t.Log("Total parity lost:", totalParityLost)
 }
 
 func BenchmarkFECDecode(b *testing.B) {
@@ -154,7 +169,7 @@ func BenchmarkFECEncode(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(payLoad)
 	encoder := newFECEncoder(dataSize, paritySize, 0)
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		data := make([]byte, payLoad)
 		encoder.encode(data, 200)
 	}

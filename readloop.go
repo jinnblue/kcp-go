@@ -38,13 +38,20 @@ func (s *UDPSession) mirrorReadLoop() {
 			s.notifyReadError(errors.WithStack(err))
 			return
 		}
+
 		if s.isClosed() {
 			return
 		}
+
 		// make sure the packet is from the same source
-		if src == "" { // set source address
+		switch src {
+		case "":
+			// set source address if not set
 			src = addr.String()
-		} else if addr.String() != src {
+		case addr.String():
+			// source valid
+		default:
+			// source invalid
 			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 			continue
 		}

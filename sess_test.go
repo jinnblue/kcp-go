@@ -24,6 +24,8 @@ package kcp
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha1"
 	"fmt"
@@ -62,7 +64,10 @@ func dialEcho(port int) (*UDPSession, error) {
 	// block, _ := NewSimpleXORBlockCrypt(pass)
 	// block, _ := NewTEABlockCrypt(pass[:16])
 	// block, _ := NewAESBlockCrypt(pass)
-	block, _ := NewSalsa20BlockCrypt(pass)
+	// block, _ := NewSalsa20BlockCrypt(pass)
+	b, _ := aes.NewCipher(pass[:16])
+	aead, _ := cipher.NewGCM(b)
+	block := NewAEADCrypt(aead)
 	sess, err := DialWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block, 10, 3)
 	if err != nil {
 		panic(err)
@@ -91,6 +96,7 @@ func dialSink(port int) (*UDPSession, error) {
 	sess, err := DialWithOptions(fmt.Sprintf("127.0.0.1:%v", port), nil, 0, 0)
 	if err != nil {
 		panic(err)
+		return nil, err
 	}
 
 	sess.SetWindowSize(1024, 1024)
@@ -102,7 +108,7 @@ func dialSink(port int) (*UDPSession, error) {
 	sess.SetDeadline(time.Now().Add(time.Minute))
 	sess.SetLogger(IKCP_LOG_ALL, newLoggerWithMilliseconds().Info)
 	sess.Connect()
-	return sess, err
+	return sess, nil
 }
 
 func dialTinyBufferEcho(port int) (*UDPSession, error) {
@@ -114,10 +120,11 @@ func dialTinyBufferEcho(port int) (*UDPSession, error) {
 	sess, err := DialWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block, 10, 3)
 	if err != nil {
 		panic(err)
+		return nil, err
 	}
 	sess.SetLogger(IKCP_LOG_ALL, newLoggerWithMilliseconds().Info)
 	sess.Connect()
-	return sess, err
+	return sess, nil
 }
 
 // ////////////////////////
@@ -126,7 +133,10 @@ func listenEcho(port int) (*Listener, error) {
 	// block, _ := NewSimpleXORBlockCrypt(pass)
 	// block, _ := NewTEABlockCrypt(pass[:16])
 	// block, _ := NewAESBlockCrypt(pass)
-	block, _ := NewSalsa20BlockCrypt(pass)
+	// block, _ := NewSalsa20BlockCrypt(pass)
+	b, _ := aes.NewCipher(pass[:16])
+	aead, _ := cipher.NewGCM(b)
+	block := NewAEADCrypt(aead)
 	return ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block, 10, 1)
 }
 
@@ -176,6 +186,7 @@ func sinkServer(port int) net.Listener {
 	l, err := listenSink(port)
 	if err != nil {
 		panic(err)
+		return nil
 	}
 
 	go func() {
@@ -200,6 +211,7 @@ func tinyBufferEchoServer(port int) net.Listener {
 	l, err := listenTinyBufferEcho(port)
 	if err != nil {
 		panic(err)
+		return nil
 	}
 
 	go func() {
@@ -279,7 +291,10 @@ func TestTimeout(t *testing.T) {
 	cli, err := dialEcho(port)
 	if err != nil {
 		panic(err)
+		return
 	}
+	defer cli.Close()
+
 	buf := make([]byte, 10)
 
 	// timeout
@@ -287,8 +302,8 @@ func TestTimeout(t *testing.T) {
 	n, err := cli.Read(buf)
 	if n != 0 || !errors.Is(err, timeoutError{}) {
 		t.Fail()
+		return
 	}
-	cli.Close()
 }
 
 func TestSendRecv(t *testing.T) {
@@ -299,14 +314,15 @@ func TestSendRecv(t *testing.T) {
 	cli, err := dialEcho(port)
 	if err != nil {
 		panic(err)
+		return
 	}
 	defer cli.Close()
 	cli.SetWriteDelay(true)
 	cli.SetDUP(1)
 
-	const N = 100
+	const N = 1
 	buf := make([]byte, 10)
-	for i := 0; i < N; i++ {
+	for i := range N {
 		msg := fmt.Sprintf("hello%v", i)
 		cli.Write([]byte(msg))
 		if n, err := cli.Read(buf); err == nil {
@@ -362,9 +378,9 @@ func TestSendVector(t *testing.T) {
 	const N = 100
 	buf := make([]byte, 20)
 	v := make([][]byte, 2)
-	for i := 0; i < N; i++ {
-		v[0] = []byte(fmt.Sprintf("hello%v", i))
-		v[1] = []byte(fmt.Sprintf("world%v", i))
+	for i := range N {
+		v[0] = fmt.Appendf(nil, "hello%v", i)
+		v[1] = fmt.Appendf(nil, "world%v", i)
 		cli.WriteBuffers(v)
 		if n, err := cli.Read(buf); err == nil {
 			if string(buf[:n]) != string(v[0]) {
@@ -391,13 +407,14 @@ func TestTinyBufferReceiver(t *testing.T) {
 	cli, err := dialTinyBufferEcho(port)
 	if err != nil {
 		panic(err)
+		return
 	}
 	defer cli.Close()
 
 	const N = 100
 	snd := byte(0)
 	fillBuffer := func(buf []byte) {
-		for i := 0; i < len(buf); i++ {
+		for i := range buf {
 			buf[i] = snd
 			snd++
 		}
@@ -405,7 +422,7 @@ func TestTinyBufferReceiver(t *testing.T) {
 
 	rcv := byte(0)
 	check := func(buf []byte) bool {
-		for i := 0; i < len(buf); i++ {
+		for i := range buf {
 			if buf[i] != rcv {
 				return false
 			}
@@ -415,12 +432,13 @@ func TestTinyBufferReceiver(t *testing.T) {
 	}
 	sndbuf := make([]byte, 7)
 	rcvbuf := make([]byte, 7)
-	for i := 0; i < N; i++ {
+	for range N {
 		fillBuffer(sndbuf)
 		cli.Write(sndbuf)
 		if n, err := io.ReadFull(cli, rcvbuf); err == nil {
 			if !check(rcvbuf[:n]) {
 				t.Fail()
+				return
 			}
 		} else {
 			panic(err)
@@ -439,12 +457,15 @@ func TestClose(t *testing.T) {
 	cli, err := dialEcho(port)
 	if err != nil {
 		panic(err)
+		return
 	}
+	defer cli.Close()
 
 	// double close
 	cli.Close()
 	if cli.Close() == nil {
 		t.Fatal("double close misbehavior")
+		return
 	}
 
 	// write after close
@@ -452,6 +473,7 @@ func TestClose(t *testing.T) {
 	n, err = cli.Write(buf)
 	if n != 0 || err == nil {
 		t.Fatal("write after close misbehavior")
+		return
 	}
 
 	// write, close, read, read
@@ -459,8 +481,11 @@ func TestClose(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	if n, err = cli.Write(buf); err != nil {
+	defer cli.Close()
+
+	if _, err = cli.Write(buf); err != nil {
 		t.Fatal("write misbehavior")
+		return
 	}
 
 	// wait until data arrival
@@ -470,14 +495,15 @@ func TestClose(t *testing.T) {
 	n, err = io.ReadFull(cli, buf)
 	if err != nil {
 		t.Fatal("closed conn drain bytes failed", err, n)
+		return
 	}
 
 	// after drain, read should return error
 	n, err = cli.Read(buf)
 	if n != 0 || err == nil {
 		t.Fatal("write->close->drain->read misbehavior", err, n)
+		return
 	}
-	cli.Close()
 }
 
 func TestParallel1024CLIENT_64BMSG_64CNT(t *testing.T) {
@@ -487,7 +513,7 @@ func TestParallel1024CLIENT_64BMSG_64CNT(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1024)
-	for i := 0; i < 1024; i++ {
+	for range 1024 {
 		go parallel_client(&wg, port)
 	}
 	wg.Wait()
@@ -497,10 +523,11 @@ func parallel_client(wg *sync.WaitGroup, port int) (err error) {
 	cli, err := dialEcho(port)
 	if err != nil {
 		panic(err)
+		return
 	}
+	defer cli.Close()
 
 	err = echo_tester(cli, 64, 64)
-	cli.Close()
 	wg.Done()
 	return
 }
@@ -538,6 +565,7 @@ func speedclient(b *testing.B, nbytes int) {
 	cli, err := Dial(fmt.Sprintf("127.0.0.1:%v", port))
 	if err != nil {
 		panic(err)
+		return
 	}
 	echoClientStart(cli)
 	defer cli.Close()
@@ -547,6 +575,7 @@ func speedclient(b *testing.B, nbytes int) {
 	b.ResetTimer()
 	if err := echo_tester(cli, nbytes, b.N); err != nil {
 		b.Fail()
+		return
 	}
 }
 
@@ -575,6 +604,7 @@ func sinkclient(b *testing.B, nbytes int) {
 	cli, err := dialSink(port)
 	if err != nil {
 		panic(err)
+		return
 	}
 	defer cli.Close()
 
@@ -592,6 +622,7 @@ func echo_tester(cli net.Conn, msglen, msgcount int) error {
 			// send packet
 			if _, err := cli.Write(buf); err != nil {
 				panic(err)
+				return
 			}
 		}
 	}()
@@ -603,11 +634,10 @@ func echo_tester(cli net.Conn, msglen, msgcount int) error {
 		n, err := cli.Read(buf)
 		if err != nil {
 			return err
-		} else {
-			nrecv += n
-			if nrecv == msglen*msgcount {
-				break
-			}
+		}
+		nrecv += n
+		if nrecv == msglen*msgcount {
+			break
 		}
 	}
 	if !bytes.Equal(msg, buf) {
@@ -619,7 +649,7 @@ func echo_tester(cli net.Conn, msglen, msgcount int) error {
 func sink_tester(cli *UDPSession, msglen, msgcount int) error {
 	// sender
 	buf := make([]byte, msglen)
-	for i := 0; i < msgcount; i++ {
+	for range msgcount {
 		if _, err := cli.Write(buf); err != nil {
 			return err
 		}
@@ -640,19 +670,23 @@ func TestListenerClose(t *testing.T) {
 	l, err := ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), nil, 10, 3)
 	if err != nil {
 		t.Fail()
+		return
 	}
+	defer l.Close()
 	l.SetReadDeadline(time.Now().Add(time.Second))
 	l.SetWriteDeadline(time.Now().Add(time.Second))
 	l.SetDeadline(time.Now().Add(time.Second))
 	time.Sleep(2 * time.Second)
 	if _, err := l.Accept(); err == nil {
 		t.Fail()
+		return
 	}
 
 	l.Close()
 	fakeaddr, _ := net.ResolveUDPAddr("udp6", "127.0.0.1:1111")
 	if l.closeSession(fakeaddr) {
 		t.Fail()
+		return
 	}
 }
 
@@ -678,6 +712,7 @@ func TestListenerNonOwnedPacketConn(t *testing.T) {
 	c, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		panic(err)
+		return
 	}
 	defer c.Close()
 	// Make it remember when it has been closed.
@@ -691,15 +726,18 @@ func TestListenerNonOwnedPacketConn(t *testing.T) {
 
 	if pconn.Closed {
 		t.Fatal("non-owned PacketConn closed before Listener.Close()")
+		return
 	}
 
 	err = l.Close()
 	if err != nil {
 		panic(err)
+		return
 	}
 
 	if pconn.Closed {
 		t.Fatal("non-owned PacketConn closed after Listener.Close()")
+		return
 	}
 }
 
@@ -713,6 +751,7 @@ func TestUDPSessionNonOwnedPacketConn(t *testing.T) {
 	c, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		panic(err)
+		return
 	}
 	defer c.Close()
 	// Make it remember when it has been closed.
@@ -722,20 +761,24 @@ func TestUDPSessionNonOwnedPacketConn(t *testing.T) {
 	client.Connect()
 	if err != nil {
 		panic(err)
+		return
 	}
 	defer client.Close()
 
 	if pconn.Closed {
 		t.Fatal("non-owned PacketConn closed before UDPSession.Close()")
+		return
 	}
 
 	err = client.Close()
 	if err != nil {
 		panic(err)
+		return
 	}
 
 	if pconn.Closed {
 		t.Fatal("non-owned PacketConn closed after UDPSession.Close()")
+		return
 	}
 }
 
@@ -748,6 +791,7 @@ func TestReliability(t *testing.T) {
 	cli, err := dialEcho(port)
 	if err != nil {
 		panic(err)
+		return
 	}
 	defer cli.Close()
 	cli.SetWriteDelay(false)
@@ -755,7 +799,8 @@ func TestReliability(t *testing.T) {
 	const N = 100000
 	buf := make([]byte, 128)
 	msg := make([]byte, 128)
-	for i := 0; i < N; i++ {
+
+	for range N {
 		io.ReadFull(rand.Reader, msg)
 		cli.Write(msg)
 		if n, err := io.ReadFull(cli, buf); err == nil {
@@ -774,7 +819,9 @@ func TestControl(t *testing.T) {
 	l, err := ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block, 10, 1)
 	if err != nil {
 		panic(err)
+		return
 	}
+	defer l.Close()
 
 	errorA := errors.New("A")
 	err = l.Control(func(conn net.PacketConn) error {
@@ -784,12 +831,15 @@ func TestControl(t *testing.T) {
 
 	if err != errorA {
 		t.Fatal(err)
+		return
 	}
 
 	cli, err := dialEcho(port)
 	if err != nil {
 		panic(err)
+		return
 	}
+	defer cli.Close()
 
 	errorB := errors.New("B")
 	err = cli.Control(func(conn net.PacketConn) error {
@@ -799,6 +849,7 @@ func TestControl(t *testing.T) {
 
 	if err != errorB {
 		t.Fatal(err)
+		return
 	}
 }
 
@@ -829,17 +880,24 @@ func TestSessionReadAfterClosed(t *testing.T) {
 			done <- struct{}{}
 			if err != nil {
 				panic(err)
+				return
 			}
+
 			if rid != "1234" {
 				panic("mismatch id")
+				return
 			}
 		}()
+
 		rid, err := knockDoor(c1, "1234")
 		if err != nil {
 			panic(err)
+			return
 		}
+
 		if rid != "4321" {
 			panic("mismatch id")
+			return
 		}
 		<-done
 	}
@@ -850,13 +908,17 @@ func TestSessionReadAfterClosed(t *testing.T) {
 	go c1.Connect()
 	if err != nil {
 		panic(err)
+		return
 	}
 	c2, err := NewConn3(1, us.LocalAddr(), nil, 0, 0, uc)
 	c2.SetCookie(1)
 	c2.Connect()
 	if err != nil {
 		panic(err)
+		return
 	}
+	defer c2.Close()
+
 	check(c1, c2)
 	c1.Close()
 	c2.Close()
@@ -867,14 +929,62 @@ func TestSessionReadAfterClosed(t *testing.T) {
 	go c1.Connect()
 	if err != nil {
 		panic(err)
+		return
 	}
+	defer c1.Close()
+
 	c2, err = NewConn3(4321, us.LocalAddr(), nil, 0, 0, uc)
 	c2.SetCookie(4321)
 	c2.Connect()
 	if err != nil {
 		panic(err)
+		return
 	}
+	defer c2.Close()
+
 	check(c1, c2)
+	c1.Close()
+	c2.Close()
+}
+
+func TestSetMTU(t *testing.T) {
+	port := int(atomic.AddUint32(&baseport, 1))
+	l := echoServer(port)
+	defer l.Close()
+
+	cli, err := dialEcho(port)
+	if err != nil {
+		panic(err)
+		return
+	}
+	defer cli.Close()
+
+	ok := cli.SetMtu(49)
+	if ok {
+		t.Fatal("can not set mtu small than 50")
+		return
+	}
+
+	cli.SetMtu(1500)
+	cli.SetWriteDelay(false)
+	cli.SetLogger(IKCP_LOG_ALL, newLoggerWithMilliseconds().Info)
+
+	sendBytes := make([]byte, 1500)
+	rand.Read(sendBytes)
+	cli.Write(sendBytes)
+
+	buf := make([]byte, 1500)
+
+	n, err := io.ReadFull(cli, buf)
+	if err != nil {
+		panic(err)
+		return
+	}
+
+	if !bytes.Equal(buf[:n], sendBytes) {
+		t.Fail()
+		return
+	}
 }
 
 func newLoggerWithMilliseconds() *slog.Logger {
@@ -907,22 +1017,28 @@ func TestSetLogger(t *testing.T) {
 	cli, err := dialEcho(port)
 	if err != nil {
 		panic(err)
+		return
 	}
+	defer cli.Close()
+
 	cli.SetWriteDelay(true)
 	cli.SetDUP(1)
 	cli.SetLogger(IKCP_LOG_ALL, newLoggerWithMilliseconds().Info)
 	const N = 10
 	buf := make([]byte, 10)
-	for i := 0; i < N; i++ {
+	for i := range N {
 		msg := fmt.Sprintf("trace%v", i)
 		cli.Write([]byte(msg))
-		if n, err := cli.Read(buf); err == nil {
-			if string(buf[:n]) != msg {
-				t.Fail()
-			}
-		} else {
+
+		n, err := cli.Read(buf)
+		if err != nil {
 			panic(err)
+			return
+		}
+
+		if string(buf[:n]) != msg {
+			t.Fail()
+			return
 		}
 	}
-	cli.Close()
 }

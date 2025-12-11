@@ -200,14 +200,11 @@ type (
 		socketReadErrorOnce  sync.Once
 		socketWriteErrorOnce sync.Once
 
-		// nonce generator
-		nonce Entropy
-
 		// packets waiting to be sent on wire
 		chPostProcessing chan []byte
 
-		xconn           batchConn // for x/net
-		xconnWriteError error
+		// platform-dependent optimizations
+		platform platform
 
 		// rate limiter (bytes per second)
 		rateLimiter atomic.Value
@@ -242,8 +239,6 @@ type UDPSessionHandler interface {
 func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, ownConn bool, remote net.Addr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
 	sess.die = make(chan struct{})
-	sess.nonce = new(nonceAES128)
-	sess.nonce.Init()
 	sess.chReadEvent = make(chan struct{}, 1)
 	sess.chWriteEvent = make(chan struct{}, 1)
 	sess.chSocketReadError = make(chan struct{})
@@ -257,30 +252,22 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.recvbufs = make([][]byte, 0, IKCP_FRG_MAX)
 	sess.udpRecvQueue = NewRingBuffer[datagram](disconnectTimes)
 
-	// cast to writebatch conn
-	if _, ok := conn.(*net.UDPConn); ok {
-		addr, err := net.ResolveUDPAddr("udp", conn.LocalAddr().String())
-		if err == nil {
-			if addr.IP.To4() != nil {
-				sess.xconn = ipv4.NewPacketConn(conn)
-			} else {
-				sess.xconn = ipv6.NewPacketConn(conn)
-			}
-		}
+	sess.initPlatform()
+
+	// calculate additional header size introduced by encryption
+	switch block := sess.block.(type) {
+	case nil:
+	case *aeadCrypt:
+		sess.headerSize = block.NonceSize()
+	default:
+		sess.headerSize = cryptHeaderSize
 	}
 
 	// FEC codec initialization
 	sess.fecDecoder = newFECDecoder(dataShards, parityShards)
-	if sess.block != nil {
-		sess.fecEncoder = newFECEncoder(dataShards, parityShards, cryptHeaderSize)
-	} else {
-		sess.fecEncoder = newFECEncoder(dataShards, parityShards, 0)
-	}
+	sess.fecEncoder = newFECEncoder(dataShards, parityShards, sess.headerSize)
 
-	// calculate additional header size introduced by FEC and encryption
-	if sess.block != nil {
-		sess.headerSize += cryptHeaderSize
-	}
+	// calculate additional header size introduced by FEC
 	if sess.fecEncoder != nil {
 		sess.headerSize += fecHeaderSizePlus2
 	}
@@ -306,7 +293,6 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 				// drop and recycle to avoid blocking; KCP will retransmit if needed
 				defaultBufferPool.Put(bts)
 			}
-
 		}
 	})
 
@@ -607,11 +593,13 @@ func (s *UDPSession) closeWithType(ct ClosedType, needlock bool) error {
 	if s.l != nil { // belongs to listener
 		s.l.closeSession(s.remote)
 		return nil
-	} else if s.ownConn { // client socket close
-		return s.conn.Close()
-	} else {
-		return nil
 	}
+
+	if s.ownConn { // client socket close
+		return s.conn.Close()
+	}
+
+	return nil
 }
 
 func (s *UDPSession) flushKcp(flushType FlushType, needlock bool) {
@@ -667,13 +655,17 @@ func (s *UDPSession) SetWindowSize(sndwnd, rcvwnd int) {
 
 // SetMtu sets the maximum transmission unit(not including UDP header)
 func (s *UDPSession) SetMtu(mtu int) bool {
-	mtu = min(mtu, mtuLimit)
+	mtu = min(mtuLimit, mtu)
+
 	mtu -= s.headerSize
+	if aead, ok := s.block.(*aeadCrypt); ok {
+		mtu -= aead.Overhead()
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.kcp.SetMtu(mtu) // kcp mtu is not including udp header
-	return true
+	ret := s.kcp.SetMtu(mtu) // kcp mtu is not including udp header
+	return ret == 0
 }
 
 // SetACKNoDelay changes ack flush option, set true to flush ack immediately,
@@ -856,25 +848,45 @@ func (s *UDPSession) postProcess() {
 				ecc = s.fecEncoder.encode(buf[mirrorHeadSize:], maxFECEncodeLatency)
 			}
 
-			// 2&3. crc32 & encryption
-			if s.block != nil {
-				// Fill nonce after the header
-				s.nonce.Fill(buf[mirrorHeadSize : mirrorHeadSize+nonceSize])
-				// Checksum calculation starts after header + cryptHeader
-				checksum := crc32.ChecksumIEEE(buf[mirrorHeadSize+cryptHeaderSize:])
-				binary.LittleEndian.PutUint32(buf[mirrorHeadSize+nonceSize:], checksum)
-				// Encrypt the body (excluding the 5-byte header)
-				s.block.Encrypt(buf[mirrorHeadSize:], buf[mirrorHeadSize:])
+			// 2. Encryption
+			switch block := s.block.(type) {
+			case nil:
+			case *aeadCrypt:
+				nonceSize := block.NonceSize()
+
+				nonceStart := mirrorHeadSize
+				nonceEnd := nonceStart + nonceSize
+				dst := buf[nonceStart:nonceEnd]
+				nonce := buf[nonceStart:nonceEnd]
+				plaintext := buf[nonceEnd:]
+
+				fillRand(nonce)
+				cryptData := block.Seal(dst, nonce, plaintext, nil)
+				buf = append(buf[:mirrorHeadSize], cryptData...)
 
 				for k := range ecc {
-					s.nonce.Fill(ecc[k][:nonceSize])
+					dst := ecc[k][:nonceSize]
+					nonce := ecc[k][:nonceSize]
+					plaintext := ecc[k][nonceSize:]
+					fillRand(nonce)
+					ecc[k] = block.Seal(dst, nonce, plaintext, nil)
+				}
+			default:
+				fillRand(buf[mirrorHeadSize : mirrorHeadSize+nonceSize])
+				checksum := crc32.ChecksumIEEE(buf[mirrorHeadSize+cryptHeaderSize:])
+				binary.LittleEndian.PutUint32(buf[mirrorHeadSize+nonceSize:], checksum)
+				// Encrypt the body (excluding the mirror header)
+				block.Encrypt(buf[mirrorHeadSize:], buf[mirrorHeadSize:])
+
+				for k := range ecc {
+					fillRand(ecc[k][:nonceSize])
 					checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:])
 					binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
-					s.block.Encrypt(ecc[k], ecc[k])
+					block.Encrypt(ecc[k], ecc[k])
 				}
 			}
 
-			// 4. TxQueue
+			// 3. TxQueue
 			var msg ipv4.Message
 			msg.Addr = s.remote
 
@@ -1120,23 +1132,44 @@ func (s *UDPSession) mirrorUnreliableInput(data []byte) []byte {
 }
 
 func packetDecrypt(block BlockCrypt, data []byte) []byte {
-	if block == nil {
+	switch block := block.(type) {
+	case nil:
+		return data
+	case *aeadCrypt:
+		nonceSize := block.NonceSize()
+		if len(data) < nonceSize+block.Overhead() {
+			break
+		}
+
+		nonce := data[:nonceSize]
+		ciphertext := data[nonceSize:]
+
+		plaintext, err := block.Open(ciphertext[:0], nonce, ciphertext, nil)
+		if err != nil {
+			atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
+			return nil
+		}
+		return plaintext
+
+	default:
+		// decryption and crc32 check
+		if len(data) < cryptHeaderSize {
+			return nil
+		}
+
+		block.Decrypt(data, data)
+		crcsum := binary.LittleEndian.Uint32(data[nonceSize:])
+		data = data[cryptHeaderSize:]
+		checksum := crc32.ChecksumIEEE(data)
+		if checksum != crcsum {
+			atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
+			return nil
+		}
+
 		return data
 	}
 
-	if len(data) < cryptHeaderSize {
-		return nil
-	}
-
-	block.Decrypt(data, data)
-	crcsum := binary.LittleEndian.Uint32(data[nonceSize:])
-	data = data[cryptHeaderSize:]
-	checksum := crc32.ChecksumIEEE(data)
-	if checksum != crcsum {
-		atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
-		return nil
-	}
-	return data
+	return nil
 }
 
 // packet input pipeline:
@@ -1149,77 +1182,87 @@ func (s *UDPSession) rdpPacketInput(data []byte) {
 	s.kcpInput(data)
 }
 
+// kcpInput inputs a decrypted and crc32-checked packet into kcp with FEC handling
 func (s *UDPSession) kcpInput(data []byte) {
-	var kcpInErrors uint64
+	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
+	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
 
+	// 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
 	fecFlag := binary.LittleEndian.Uint16(data[4:])
-	if fecFlag == typeData || fecFlag == typeParity { // 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
-		if len(data) >= fecHeaderSizePlus2 {
-			f := fecPacket(data)
-			// lock
-			s.mu.Lock()
-			// if fecDecoder is not initialized, create one with default parameter
-			// lazy initialization
-			if s.fecDecoder == nil {
-				s.fecDecoder = newFECDecoder(1, 1)
-			}
+	switch fecFlag {
+	case typeData, typeParity: // packet with FEC
+		if len(data) < fecHeaderSizePlus2 {
+			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+			return
+		}
 
-			// FEC decoding
-			recovers := s.fecDecoder.decode(f)
-			if f.flag() == typeData {
-				if ret := s.kcp.Input(data[fecHeaderSizePlus2:], IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
-					kcpInErrors++
-				}
-			}
+		var kcpInErrors uint64
+		f := fecPacket(data)
 
-			// If there're some packets recovered from FEC, feed them into kcp
-			for _, r := range recovers {
-				if len(r) >= 2 { // must be larger than 2bytes
-					sz := binary.LittleEndian.Uint16(r)
-					if int(sz) <= len(r) && sz >= 2 {
-						if ret := s.kcp.Input(r[2:sz], IKCP_PACKET_FEC, s.ackNoDelay); ret != 0 {
-							kcpInErrors++
-						}
+		// lock
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		// if fecDecoder is not initialized, create one with default parameter
+		// lazy initialization
+		if s.fecDecoder == nil {
+			s.fecDecoder = newFECDecoder(1, 1)
+		}
+
+		// FEC decoding
+		recovers := s.fecDecoder.decode(f)
+		if f.flag() == typeData {
+			if ret := s.kcp.Input(data[fecHeaderSizePlus2:], IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
+				kcpInErrors++
+			}
+		}
+
+		// If there're some packets recovered from FEC, feed them into kcp
+		for _, r := range recovers {
+			if len(r) >= 2 { // must be larger than 2bytes
+				sz := binary.LittleEndian.Uint16(r)
+				if int(sz) <= len(r) && sz >= 2 {
+					if ret := s.kcp.Input(r[2:sz], IKCP_PACKET_FEC, s.ackNoDelay); ret != 0 {
+						kcpInErrors++
 					}
 				}
-				// recycle the buffer
-				defaultBufferPool.Put(r)
 			}
-
-			// to notify the readers to receive the data if there's any
-			if n := s.kcp.PeekSize(); n > 0 {
-				s.notifyReadEvent()
-			}
-
-			// to notify the writers if the window size allows to send more packets
-			// and the remote window size is not full.
-			waitsnd := s.kcp.WaitSnd()
-			if waitsnd < int(s.kcp.snd_wnd) {
-				s.notifyWriteEvent()
-			}
-			s.mu.Unlock()
-		} else {
-			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+			// recycle the buffer
+			defaultBufferPool.Put(r)
 		}
-	} else {
-		s.mu.Lock()
-		if ret := s.kcp.Input(data, IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
-			kcpInErrors++
-		}
+
+		// to notify the readers to receive the data if there's any
 		if n := s.kcp.PeekSize(); n > 0 {
 			s.notifyReadEvent()
 		}
+
+		// to notify the writers if the window size allows to send more packets
+		// and the remote window size is not full.
 		waitsnd := s.kcp.WaitSnd()
 		if waitsnd < int(s.kcp.snd_wnd) {
 			s.notifyWriteEvent()
 		}
-		s.mu.Unlock()
-	}
 
-	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
-	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
-	if kcpInErrors > 0 {
-		atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
+		if kcpInErrors > 0 {
+			atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
+		}
+	default: // packet without FEC
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if ret := s.kcp.Input(data, IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
+			atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+		}
+
+		if n := s.kcp.PeekSize(); n > 0 {
+			s.notifyReadEvent()
+		}
+
+		waitsnd := s.kcp.WaitSnd()
+		if waitsnd < int(s.kcp.snd_wnd) {
+			s.notifyWriteEvent()
+		}
+		return
 	}
 }
 
@@ -1476,16 +1519,16 @@ func (l *Listener) notifyReadError(err error) {
 
 // SetReadBuffer sets the socket read buffer for the Listener
 func (l *Listener) SetReadBuffer(bytes int) error {
-	if nc, ok := l.conn.(setReadBuffer); ok {
-		return nc.SetReadBuffer(bytes)
+	if conn, ok := l.conn.(setReadBuffer); ok {
+		return conn.SetReadBuffer(bytes)
 	}
 	return errInvalidOperation
 }
 
 // SetWriteBuffer sets the socket write buffer for the Listener
 func (l *Listener) SetWriteBuffer(bytes int) error {
-	if nc, ok := l.conn.(setWriteBuffer); ok {
-		return nc.SetWriteBuffer(bytes)
+	if conn, ok := l.conn.(setWriteBuffer); ok {
+		return conn.SetWriteBuffer(bytes)
 	}
 	return errInvalidOperation
 }
@@ -1496,23 +1539,28 @@ func (l *Listener) SetWriteBuffer(bytes int) error {
 // this function instead.
 func (l *Listener) SetDSCP(dscp int) error {
 	// interface enabled
-	if ts, ok := l.conn.(setDSCP); ok {
-		return ts.SetDSCP(dscp)
+	if conn, ok := l.conn.(setDSCP); ok {
+		return conn.SetDSCP(dscp)
 	}
 
-	if nc, ok := l.conn.(net.Conn); ok {
-		var succeed bool
-		if err := ipv4.NewConn(nc).SetTOS(dscp << 2); err == nil {
-			succeed = true
-		}
-		if err := ipv6.NewConn(nc).SetTrafficClass(dscp); err == nil {
-			succeed = true
-		}
-
-		if succeed {
-			return nil
-		}
+	conn, ok := l.conn.(net.Conn)
+	if !ok {
+		return errInvalidOperation
 	}
+
+	var succeed bool
+	if err := ipv4.NewConn(conn).SetTOS(dscp << 2); err == nil {
+		succeed = true
+	}
+
+	if err := ipv6.NewConn(conn).SetTrafficClass(dscp); err == nil {
+		succeed = true
+	}
+
+	if succeed {
+		return nil
+	}
+
 	return errInvalidOperation
 }
 
@@ -1557,7 +1605,9 @@ func (l *Listener) SetReadDeadline(t time.Time) error {
 }
 
 // SetWriteDeadline implements the Conn SetWriteDeadline method.
-func (l *Listener) SetWriteDeadline(t time.Time) error { return errInvalidOperation }
+func (l *Listener) SetWriteDeadline(t time.Time) error {
+	return errInvalidOperation
+}
 
 func (s *Listener) SetHandler(h ListenerHandler) {
 	s.sessionLock.Lock()
@@ -1593,6 +1643,7 @@ func (l *Listener) Close() error {
 func (l *Listener) Control(f func(conn net.PacketConn) error) error {
 	l.sessionLock.Lock()
 	defer l.sessionLock.Unlock()
+
 	return f(l.conn)
 }
 
@@ -1616,10 +1667,14 @@ func (l *Listener) closeSession(remote net.Addr) bool {
 }
 
 // Addr returns the listener's network address, The Addr returned is shared by all invocations of Addr, so do not modify it.
-func (l *Listener) Addr() net.Addr { return l.conn.LocalAddr() }
+func (l *Listener) Addr() net.Addr {
+	return l.conn.LocalAddr()
+}
 
 // Listen listens for incoming KCP packets addressed to the local address laddr on the network "udp",
-func Listen(laddr string) (net.Listener, error) { return ListenWithOptions(laddr, nil, 0, 0) }
+func Listen(laddr string) (net.Listener, error) {
+	return ListenWithOptions(laddr, nil, 0, 0)
+}
 
 // ListenWithOptions listens for incoming KCP packets addressed to the local address laddr on the network "udp" with packet encryption.
 //
@@ -1633,6 +1688,7 @@ func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards 
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+
 	conn, err := net.ListenUDP("udp", udpaddr)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1663,7 +1719,9 @@ func serveConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketCo
 }
 
 // Dial connects to the remote address "raddr" on the network "udp" without encryption and FEC
-func Dial(raddr string) (net.Conn, error) { return DialWithOptions(raddr, nil, 0, 0) }
+func Dial(raddr string) (net.Conn, error) {
+	return DialWithOptions(raddr, nil, 0, 0)
+}
 
 // DialWithOptions connects to the remote address "raddr" on the network "udp" with packet encryption
 //
@@ -1678,6 +1736,7 @@ func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards in
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+
 	network := "udp4"
 	if udpaddr.IP.To4() == nil {
 		network = "udp"

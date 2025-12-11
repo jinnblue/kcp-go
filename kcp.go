@@ -49,7 +49,7 @@ const (
 	IKCP_DEADLINK    = 12 // dead link 5~8s
 	IKCP_THRESH_INIT = 2
 	IKCP_THRESH_MIN  = 2
-	IKCP_PROBE_INIT  = 7000   // 7 secs to probe window size
+	IKCP_PROBE_INIT  = 500    // 500ms to probe window size
 	IKCP_PROBE_LIMIT = 120000 // up to 120 secs to probe window
 	IKCP_SN_OFFSET   = 12
 )
@@ -1196,14 +1196,9 @@ func (kcp *KCP) SetMtu(mtu int) int {
 		return -1
 	}
 
-	buffer := make([]byte, mtu)
-	if buffer == nil {
-		return -2
-	}
-
 	kcp.mtu = uint32(mtu)
 	kcp.mss = kcp.mtu - IKCP_OVERHEAD
-	kcp.buffer = buffer
+	kcp.buffer = make([]byte, mtu)
 	return 0
 }
 

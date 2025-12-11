@@ -43,11 +43,13 @@ func TestLossyConn1(t *testing.T) {
 	client, err := lossyconn.NewLossyConn(0.1, 100)
 	if err != nil {
 		t.Fatal(err)
+		return
 	}
 
 	server, err := lossyconn.NewLossyConn(0.1, 100)
 	if err != nil {
 		t.Fatal(err)
+		return
 	}
 	testlink(t, client, server, 1, 10, 2, 1)
 }
@@ -58,11 +60,13 @@ func TestLossyConn2(t *testing.T) {
 	client, err := lossyconn.NewLossyConn(0.2, 100)
 	if err != nil {
 		t.Fatal(err)
+		return
 	}
 
 	server, err := lossyconn.NewLossyConn(0.2, 100)
 	if err != nil {
 		t.Fatal(err)
+		return
 	}
 	testlink(t, client, server, 1, 10, 2, 1)
 }
@@ -73,11 +77,13 @@ func TestLossyConn3(t *testing.T) {
 	client, err := lossyconn.NewLossyConn(0.3, 100)
 	if err != nil {
 		t.Fatal(err)
+		return
 	}
 
 	server, err := lossyconn.NewLossyConn(0.3, 100)
 	if err != nil {
 		t.Fatal(err)
+		return
 	}
 	testlink(t, client, server, 1, 10, 2, 1)
 }
@@ -88,11 +94,13 @@ func TestLossyConn4(t *testing.T) {
 	client, err := lossyconn.NewLossyConn(0.1, 100)
 	if err != nil {
 		t.Fatal(err)
+		return
 	}
 
 	server, err := lossyconn.NewLossyConn(0.1, 100)
 	if err != nil {
 		t.Fatal(err)
+		return
 	}
 	testlink(t, client, server, 1, 10, 2, 0)
 }
@@ -135,7 +143,7 @@ func testlink(t *testing.T, client *lossyconn.LossyConn, server *lossyconn.Lossy
 		s.SetNoDelay(nodelay, interval, resend, nc)
 		buf := make([]byte, 64)
 		var rtt time.Duration
-		for i := 0; i < repeat; i++ {
+		for range repeat {
 			start := time.Now()
 			s.Write(buf)
 			io.ReadFull(s, buf)
@@ -157,10 +165,10 @@ func BenchmarkFlush(b *testing.B) {
 	for range kcp.snd_buf.MaxLen() {
 		kcp.snd_buf.Push(segment{xmit: 1, resendts: currentMs() + 10000})
 	}
-	b.ResetTimer()
+
 	b.ReportAllocs()
 	var mu sync.Mutex
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		mu.Lock()
 		kcp.flush(IKCP_FLUSH_FULL)
 		mu.Unlock()
@@ -352,8 +360,7 @@ func BenchmarkDebugLog(b *testing.B) {
 	}
 	kcp.log = slog.Debug
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		// In release mode, this line of code will be completely 'erased' by the compiler,
 		// as if it doesn't exist at all, and even the parameter's interface conversion will not occur.
 		kcp.debugLog(IKCP_LOG_OUT_WASK, "conv", kcp.conv, "wnd", kcp.snd_wnd)
