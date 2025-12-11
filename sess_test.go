@@ -24,14 +24,13 @@ package kcp
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha1"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -59,15 +58,20 @@ func init() {
 	log.Println("beginning tests, encryption:salsa20, fec:10/3")
 }
 
-func dialEcho(port int) (*UDPSession, error) {
+func nextPort() int {
+	port := int(atomic.AddUint32(&baseport, 1))
+	port %= 65536
+	if port <= 1024 {
+		port += 1024
+	}
+	return port
+}
+
+func dialEcho(port int, block BlockCrypt) (*UDPSession, error) {
 	// block, _ := NewNoneBlockCrypt(pass)
 	// block, _ := NewSimpleXORBlockCrypt(pass)
 	// block, _ := NewTEABlockCrypt(pass[:16])
 	// block, _ := NewAESBlockCrypt(pass)
-	// block, _ := NewSalsa20BlockCrypt(pass)
-	b, _ := aes.NewCipher(pass[:16])
-	aead, _ := cipher.NewGCM(b)
-	block := NewAEADCrypt(aead)
 	sess, err := DialWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block, 10, 3)
 	if err != nil {
 		panic(err)
@@ -128,15 +132,11 @@ func dialTinyBufferEcho(port int) (*UDPSession, error) {
 }
 
 // ////////////////////////
-func listenEcho(port int) (*Listener, error) {
+func listenEcho(port int, block BlockCrypt) (*Listener, error) {
 	// block, _ := NewNoneBlockCrypt(pass)
 	// block, _ := NewSimpleXORBlockCrypt(pass)
 	// block, _ := NewTEABlockCrypt(pass[:16])
 	// block, _ := NewAESBlockCrypt(pass)
-	// block, _ := NewSalsa20BlockCrypt(pass)
-	b, _ := aes.NewCipher(pass[:16])
-	aead, _ := cipher.NewGCM(b)
-	block := NewAEADCrypt(aead)
 	return ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block, 10, 1)
 }
 
@@ -153,8 +153,8 @@ func listenSink(port int) (net.Listener, error) {
 	return ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), nil, 0, 0)
 }
 
-func echoServer(port int) net.Listener {
-	l, err := listenEcho(port)
+func echoServer(port int, block BlockCrypt) net.Listener {
+	l, err := listenEcho(port, block)
 	if err != nil {
 		panic(err)
 	}
@@ -284,11 +284,13 @@ func handleTinyBufferEcho(conn *UDPSession) {
 ///////////////////////////
 
 func TestTimeout(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
-	l := echoServer(port)
+	port := nextPort()
+	block1, _ := NewSalsa20BlockCrypt(pass)
+	l := echoServer(port, block1)
 	defer l.Close()
 
-	cli, err := dialEcho(port)
+	block2, _ := NewSalsa20BlockCrypt(pass)
+	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
 		return
@@ -306,101 +308,244 @@ func TestTimeout(t *testing.T) {
 	}
 }
 
-func TestSendRecv(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
-	l := echoServer(port)
+func TestCFBSendRecv(t *testing.T) {
+	port := nextPort()
+	block1, _ := NewTripleDESBlockCrypt(pass)
+	l := echoServer(port, block1)
 	defer l.Close()
 
-	cli, err := dialEcho(port)
+	block2, _ := NewTripleDESBlockCrypt(pass)
+	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
 		return
 	}
 	defer cli.Close()
 	cli.SetWriteDelay(true)
-	cli.SetDUP(1)
 
-	const N = 1
-	buf := make([]byte, 10)
-	for i := range N {
-		msg := fmt.Sprintf("hello%v", i)
-		cli.Write([]byte(msg))
-		if n, err := cli.Read(buf); err == nil {
-			if string(buf[:n]) != msg {
-				t.Fail()
-			}
-		} else {
-			panic(err)
-		}
-	}
+	randomEchoTest(t, cli)
 }
 
-func TestSendRecvBig(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
-	l := echoServer(port)
+func TestSalsa20SendRecv(t *testing.T) {
+	port := nextPort()
+	block1, _ := NewSalsa20BlockCrypt(pass)
+	l := echoServer(port, block1)
 	defer l.Close()
 
-	cli, err := dialEcho(port)
+	block2, _ := NewSalsa20BlockCrypt(pass)
+	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
+		return
 	}
 	defer cli.Close()
 	cli.SetWriteDelay(true)
 
-	const N = 100
-	msg := make([]byte, 4096)
-	buf := make([]byte, 4096)
-	for i := 0; i < N; i++ {
-		io.ReadFull(rand.Reader, msg)
-		cli.Write([]byte(msg))
-		if n, err := io.ReadFull(cli, buf); err == nil {
-			if !bytes.Equal(msg, buf[:n]) {
-				t.Fail()
+	randomEchoTest(t, cli)
+}
+
+func TestAEADSendRecv(t *testing.T) {
+	port := nextPort()
+	block1, _ := NewAESGCMCrypt(pass)
+	l := echoServer(port, block1)
+	defer l.Close()
+
+	block2, _ := NewAESGCMCrypt(pass)
+	cli, err := dialEcho(port, block2)
+	if err != nil {
+		panic(err)
+		return
+	}
+	defer cli.Close()
+	cli.SetWriteDelay(true)
+
+	randomEchoTest(t, cli)
+}
+
+func TestPlainTextSendRecv(t *testing.T) {
+	port := nextPort()
+	l := echoServer(port, nil)
+	defer l.Close()
+
+	cli, err := dialEcho(port, nil)
+	if err != nil {
+		panic(err)
+		return
+	}
+	defer cli.Close()
+	cli.SetWriteDelay(true)
+
+	randomEchoTest(t, cli)
+}
+
+func randomEchoTest(t *testing.T, cli *UDPSession) {
+	seed := time.Now().UnixNano()
+	writerSrc := mrand.NewSource(seed)
+	readerSrc := mrand.NewSource(seed)
+
+	bytesSent := int64(0)
+	bytesReceived := int64(0)
+
+	const N = 100 * 1024 * 1024
+	maxPackLen := int(cli.kcp.mss) * IKCP_FRG_MAX
+
+	// Writer goroutine
+	go func() {
+		r := mrand.New(writerSrc)
+		lastPrint := 0
+		for bytesSent < N {
+			length := mrand.Intn(maxPackLen) + 1 // Random length between 1 and maxPackLen
+			if bytesSent+int64(length) > N {
+				length = int(N - bytesSent)
 			}
-		} else {
-			panic(err)
+			sndbuf := make([]byte, length)
+			for i := range sndbuf {
+				sndbuf[i] = byte(r.Int())
+			}
+
+			n, err := cli.Write(sndbuf)
+			if err != nil {
+				t.Errorf("Write error: %v", err)
+				return
+			}
+			bytesSent += int64(n)
+			if percent := int(bytesSent * 100 / N); percent >= lastPrint+10 {
+				lastPrint = percent
+				t.Logf("Sent %d%% (%d/%d bytes)", percent, bytesSent, N)
+			}
+		}
+	}()
+
+	// Reader goroutine
+	r := mrand.New(readerSrc)
+	lastPrint := 0
+	for bytesReceived < N {
+		length := mrand.Intn(maxPackLen) + 1 // Random length between 1 and maxPackLen
+		if bytesReceived+int64(length) > N {
+			length = int(N - bytesReceived)
+		}
+		rcvbuf := make([]byte, length)
+		n, err := cli.Read(rcvbuf)
+		if err != nil && err != io.EOF {
+			t.Fatalf("Read error: %v", err)
+		}
+		for i := 0; i < n; i++ {
+			expectedByte := byte(r.Int())
+			if rcvbuf[i] != expectedByte {
+				t.Fatalf("Data mismatch at byte %d: got %v, want %v", bytesReceived+int64(i), rcvbuf[i], expectedByte)
+			}
+		}
+		bytesReceived += int64(n)
+		if percent := int(bytesReceived * 100 / N); percent >= lastPrint+10 {
+			lastPrint = percent
+			t.Logf("Received %d%% (%d/%d bytes)", percent, bytesReceived, N)
 		}
 	}
 }
 
 func TestSendVector(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
-	l := echoServer(port)
+	port := nextPort()
+	block1, _ := NewSalsa20BlockCrypt(pass)
+	l := echoServer(port, block1)
 	defer l.Close()
 
-	cli, err := dialEcho(port)
+	block2, _ := NewSalsa20BlockCrypt(pass)
+	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
 	}
 	defer cli.Close()
 	cli.SetWriteDelay(false)
+	randomEchoVectorTest(t, cli)
+}
 
-	const N = 100
-	buf := make([]byte, 20)
-	v := make([][]byte, 2)
-	for i := range N {
-		v[0] = fmt.Appendf(nil, "hello%v", i)
-		v[1] = fmt.Appendf(nil, "world%v", i)
-		cli.WriteBuffers(v)
-		if n, err := cli.Read(buf); err == nil {
-			if string(buf[:n]) != string(v[0]) {
-				t.Error(string(buf[:n]), string(v[0]))
+func randomEchoVectorTest(t *testing.T, cli *UDPSession) {
+	seed := time.Now().UnixNano()
+	writerSrc := mrand.NewSource(seed)
+	readerSrc := mrand.NewSource(seed)
+
+	bytesSent := int64(0)
+	bytesReceived := int64(0)
+
+	const N = 100 * 1024 * 1024
+
+	// Writer goroutine
+	go func() {
+		r := mrand.New(writerSrc)
+		lastPrint := 0
+		v := make([][]byte, 2)
+		for bytesSent < N {
+			length1 := mrand.Intn(1<<20) + 1 // Random length between 1 and 1MB
+			if bytesSent+int64(length1) > N {
+				length1 = int(N - bytesSent)
 			}
-		} else {
-			panic(err)
+			sndbuf1 := make([]byte, length1)
+
+			for i := range sndbuf1 {
+				sndbuf1[i] = byte(r.Int())
+			}
+
+			length2 := mrand.Intn(1<<20) + 1 // Random length between 1 and 1MB
+			if bytesSent+int64(length2) > N {
+				length2 = int(N - bytesSent)
+			}
+
+			sndbuf2 := make([]byte, length2)
+			for i := range sndbuf2 {
+				sndbuf2[i] = byte(r.Int())
+			}
+
+			v[0] = sndbuf1
+			v[1] = sndbuf2
+
+			n, err := cli.WriteBuffers(v)
+			if err != nil {
+				t.Errorf("Write error: %v", err)
+				return
+			}
+
+			if n != length1+length2 {
+				t.Errorf("Write length mismatch: got %v, want %v", n, length1+length2)
+				return
+			}
+
+			bytesSent += int64(n)
+			if percent := int(bytesSent * 100 / N); percent >= lastPrint+10 {
+				lastPrint = percent
+				t.Logf("Sent %d%% (%d/%d bytes)", percent, bytesSent, N)
+			}
 		}
-		if n, err := cli.Read(buf); err == nil {
-			if string(buf[:n]) != string(v[1]) {
-				t.Error(string(buf[:n]), string(v[1]))
+	}()
+
+	// Reader goroutine
+	r := mrand.New(readerSrc)
+	lastPrint := 0
+	for bytesReceived < N {
+		length := mrand.Intn(1<<20) + 1 // Random length between 1 and 1MB
+		if bytesReceived+int64(length) > N {
+			length = int(N - bytesReceived)
+		}
+		rcvbuf := make([]byte, length)
+		n, err := cli.Read(rcvbuf)
+		if err != nil && err != io.EOF {
+			t.Fatalf("Read error: %v", err)
+		}
+		for i := 0; i < n; i++ {
+			expectedByte := byte(r.Int())
+			if rcvbuf[i] != expectedByte {
+				t.Fatalf("Data mismatch at byte %d: got %v, want %v", bytesReceived+int64(i), rcvbuf[i], expectedByte)
 			}
-		} else {
-			panic(err)
+		}
+		bytesReceived += int64(n)
+		if percent := int(bytesReceived * 100 / N); percent >= lastPrint+10 {
+			lastPrint = percent
+			t.Logf("Received %d%% (%d/%d bytes)", percent, bytesReceived, N)
 		}
 	}
 }
 
 func TestTinyBufferReceiver(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
+	port := nextPort()
 	l := tinyBufferEchoServer(port)
 	defer l.Close()
 
@@ -450,11 +595,13 @@ func TestClose(t *testing.T) {
 	var n int
 	var err error
 
-	port := int(atomic.AddUint32(&baseport, 1))
-	l := echoServer(port)
+	port := nextPort()
+	block1, _ := NewSalsa20BlockCrypt(pass)
+	l := echoServer(port, block1)
 	defer l.Close()
 
-	cli, err := dialEcho(port)
+	block2, _ := NewSalsa20BlockCrypt(pass)
+	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
 		return
@@ -477,7 +624,8 @@ func TestClose(t *testing.T) {
 	}
 
 	// write, close, read, read
-	cli, err = dialEcho(port)
+	block3, _ := NewSalsa20BlockCrypt(pass)
+	cli, err = dialEcho(port, block3)
 	if err != nil {
 		panic(err)
 	}
@@ -507,8 +655,9 @@ func TestClose(t *testing.T) {
 }
 
 func TestParallel1024CLIENT_64BMSG_64CNT(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
-	l := echoServer(port)
+	port := nextPort()
+	block, _ := NewSalsa20BlockCrypt(pass)
+	l := echoServer(port, block)
 	defer l.Close()
 
 	var wg sync.WaitGroup
@@ -520,7 +669,8 @@ func TestParallel1024CLIENT_64BMSG_64CNT(t *testing.T) {
 }
 
 func parallel_client(wg *sync.WaitGroup, port int) (err error) {
-	cli, err := dialEcho(port)
+	block, _ := NewSalsa20BlockCrypt(pass)
+	cli, err := dialEcho(port, block)
 	if err != nil {
 		panic(err)
 		return
@@ -554,15 +704,17 @@ func BenchmarkEchoSpeed256K(b *testing.B) {
 }
 
 func speedclient(b *testing.B, nbytes int) {
-	port := int(atomic.AddUint32(&baseport, 1))
-	l, err := Listen(fmt.Sprintf("127.0.0.1:%v", port))
+	port := nextPort()
+	block1, _ := NewSalsa20BlockCrypt(pass)
+	l, err := ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block1, 0, 0)
 	if err != nil {
 		panic(err)
 	}
 	echoServerStart(l, nbytes)
 	defer l.Close()
 
-	cli, err := Dial(fmt.Sprintf("127.0.0.1:%v", port))
+	block2, _ := NewSalsa20BlockCrypt(pass)
+	cli, err := DialWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block2, 0, 0)
 	if err != nil {
 		panic(err)
 		return
@@ -596,7 +748,7 @@ func BenchmarkSinkSpeed256K(b *testing.B) {
 }
 
 func sinkclient(b *testing.B, nbytes int) {
-	port := int(atomic.AddUint32(&baseport, 1))
+	port := nextPort()
 	l := sinkServer(port)
 	defer l.Close()
 
@@ -666,7 +818,7 @@ func TestSNMP(t *testing.T) {
 }
 
 func TestListenerClose(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
+	port := nextPort()
 	l, err := ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), nil, 10, 3)
 	if err != nil {
 		t.Fail()
@@ -784,11 +936,13 @@ func TestUDPSessionNonOwnedPacketConn(t *testing.T) {
 
 // this function test the data correctness with FEC and encryption enabled
 func TestReliability(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
-	l := echoServer(port)
+	port := nextPort()
+	block1, _ := NewSalsa20BlockCrypt(pass)
+	l := echoServer(port, block1)
 	defer l.Close()
 
-	cli, err := dialEcho(port)
+	block2, _ := NewSalsa20BlockCrypt(pass)
+	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
 		return
@@ -814,7 +968,7 @@ func TestReliability(t *testing.T) {
 }
 
 func TestControl(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
+	port := nextPort()
 	block, _ := NewSalsa20BlockCrypt(pass)
 	l, err := ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block, 10, 1)
 	if err != nil {
@@ -834,7 +988,8 @@ func TestControl(t *testing.T) {
 		return
 	}
 
-	cli, err := dialEcho(port)
+	block2, _ := NewSalsa20BlockCrypt(pass)
+	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
 		return
@@ -948,11 +1103,13 @@ func TestSessionReadAfterClosed(t *testing.T) {
 }
 
 func TestSetMTU(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
-	l := echoServer(port)
+	port := nextPort()
+	block1, _ := NewSalsa20BlockCrypt(pass)
+	l := echoServer(port, block1)
 	defer l.Close()
 
-	cli, err := dialEcho(port)
+	block2, _ := NewSalsa20BlockCrypt(pass)
+	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
 		return
@@ -1010,11 +1167,13 @@ func newLoggerWithMilliseconds() *slog.Logger {
 //
 //	go test -run ^TestSetLogger$
 func TestSetLogger(t *testing.T) {
-	port := int(atomic.AddUint32(&baseport, 1))
-	l := echoServer(port)
+	port := nextPort()
+	block1, _ := NewSalsa20BlockCrypt(pass)
+	l := echoServer(port, block1)
 	defer l.Close()
 
-	cli, err := dialEcho(port)
+	block2, _ := NewSalsa20BlockCrypt(pass)
+	cli, err := dialEcho(port, block2)
 	if err != nil {
 		panic(err)
 		return

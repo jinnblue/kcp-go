@@ -258,6 +258,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	// calculate additional header size introduced by encryption
 	switch block := sess.block.(type) {
 	case nil:
+		sess.headerSize = 0
 	case *aeadCrypt:
 		sess.headerSize = block.NonceSize()
 	default:
@@ -296,6 +297,11 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 			}
 		}
 	})
+
+	// Set Default MTU
+	if !sess.SetMtu(IKCP_MTU_DEF) {
+		panic("Overhead too large")
+	}
 
 	// create post-processing goroutine
 	go sess.postProcess()
@@ -870,7 +876,7 @@ func (s *UDPSession) postProcess() {
 			// 2. Encryption
 			switch block := s.block.(type) {
 			case nil:
-			case *aeadCrypt:
+			case *aeadCrypt: // AEAD mode
 				nonceSize := block.NonceSize()
 
 				nonceStart := mirrorHeadSize
@@ -890,11 +896,10 @@ func (s *UDPSession) postProcess() {
 					fillRand(nonce)
 					ecc[k] = block.Seal(dst, nonce, plaintext, nil)
 				}
-			default:
+			default: // Cipher Feedback (CFB) mode
 				fillRand(buf[mirrorHeadSize : mirrorHeadSize+nonceSize])
 				checksum := crc32.ChecksumIEEE(buf[mirrorHeadSize+cryptHeaderSize:])
 				binary.LittleEndian.PutUint32(buf[mirrorHeadSize+nonceSize:], checksum)
-				// Encrypt the body (excluding the mirror header)
 				block.Encrypt(buf[mirrorHeadSize:], buf[mirrorHeadSize:])
 
 				for k := range ecc {
@@ -1194,7 +1199,9 @@ func packetDecrypt(block BlockCrypt, data []byte) []byte {
 // network -> [decryption ->] [crc32 ->] [FEC ->] [KCP input ->] stream -> application
 func (s *UDPSession) rdpPacketInput(data []byte) {
 	data = packetDecrypt(s.block, data)
+	// basic check for minimum packet size
 	if len(data) < IKCP_OVERHEAD {
+		atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
 		return
 	}
 	s.kcpInput(data)
