@@ -144,7 +144,8 @@ var (
 	errInvalidOperation = errors.New("invalid operation")
 	errTimeout          = timeoutError{}
 	errNotOwner         = errors.New("not the owner of this connection")
-	errKcpDeadLink      = errors.New("kcp dead link")
+	errDeadLink         = errors.New("dead link")
+	errInvalidState     = errors.New("invalid state")
 )
 
 // timeoutError implements net.Error
@@ -469,7 +470,10 @@ RESET_TIMER:
 		case <-s.chSocketReadError:
 			return 0, s.socketReadError.Load().(error)
 		case <-s.die:
-			return 0, errors.WithStack(io.ErrClosedPipe)
+			if err = s.closeError(); errors.Is(err, net.ErrClosed) {
+				err = io.EOF
+			}
+			return 0, err
 		}
 	}
 }
@@ -494,7 +498,7 @@ RESET_TIMER:
 		case <-s.chSocketWriteError:
 			return 0, s.socketWriteError.Load().(error)
 		case <-s.die:
-			return 0, errors.WithStack(io.ErrClosedPipe)
+			return 0, s.closeError()
 		default:
 			if s.state.Load() == stateConnected {
 				<-s.chWriteEvent
@@ -543,8 +547,20 @@ RESET_TIMER:
 		case <-s.chSocketWriteError:
 			return 0, s.socketWriteError.Load().(error)
 		case <-s.die:
-			return 0, errors.WithStack(io.ErrClosedPipe)
+			return 0, s.closeError()
 		}
+	}
+}
+
+func (s *UDPSession) closeError() (err error) {
+	ct := ClosedType(s.closed.Load())
+	switch ct {
+	case ClosedByDeadLink:
+		return errDeadLink
+	case ClosedByErrState:
+		return errInvalidState
+	default:
+		return net.ErrClosed
 	}
 }
 
@@ -571,9 +587,12 @@ func (s *UDPSession) Close() error {
 }
 
 // Close closes the connection.
-func (s *UDPSession) closeWithType(ct ClosedType, needlock bool) error {
+func (s *UDPSession) closeWithType(ct ClosedType, needlock bool) (err error) {
 	if !s.closed.CompareAndSwap(0, int32(ct)) {
-		return errors.WithStack(io.ErrClosedPipe)
+		if err = s.closeError(); errors.Is(err, net.ErrClosed) {
+			err = nil
+		}
+		return err
 	}
 
 	// try best to send all queued messages especially the data in txqueue
@@ -1089,7 +1108,6 @@ func (s *UDPSession) mirrorReliableInput(data []byte) []byte {
 					return data[mirrorCmdSize:]
 				}
 			}
-			s.notifyReadEvent()
 		} else if cmd == cmdReliableData {
 			s.closeWithType(ClosedByErrState, false)
 		}
