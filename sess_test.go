@@ -24,6 +24,8 @@ package kcp
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha1"
 	"fmt"
@@ -323,7 +325,7 @@ func TestCFBSendRecv(t *testing.T) {
 	defer cli.Close()
 	cli.SetWriteDelay(true)
 
-	randomEchoTest(t, cli)
+	randomEchoTest(t, cli, 100*1024*1024)
 }
 
 func TestSalsa20SendRecv(t *testing.T) {
@@ -341,7 +343,7 @@ func TestSalsa20SendRecv(t *testing.T) {
 	defer cli.Close()
 	cli.SetWriteDelay(true)
 
-	randomEchoTest(t, cli)
+	randomEchoTest(t, cli, 100*1024*1024)
 }
 
 func TestAEADSendRecv(t *testing.T) {
@@ -359,7 +361,7 @@ func TestAEADSendRecv(t *testing.T) {
 	defer cli.Close()
 	cli.SetWriteDelay(true)
 
-	randomEchoTest(t, cli)
+	randomEchoTest(t, cli, 100*1024*1024)
 }
 
 func TestPlainTextSendRecv(t *testing.T) {
@@ -375,24 +377,52 @@ func TestPlainTextSendRecv(t *testing.T) {
 	defer cli.Close()
 	cli.SetWriteDelay(true)
 
-	randomEchoTest(t, cli)
+	randomEchoTest(t, cli, 100*1024*1024)
 }
 
-func randomEchoTest(t *testing.T, cli *UDPSession) {
+func Test1GBEcho(t *testing.T) {
+	port := nextPort()
+	l := echoServer(port, nil)
+	defer l.Close()
+
+	cli, err := dialEcho(port, nil)
+	if err != nil {
+		panic(err)
+		return
+	}
+	defer cli.Close()
+	cli.SetWriteDelay(true)
+	randomEchoTest(t, cli, 1*1024*1024*1024)
+}
+
+func Test6GBEcho(t *testing.T) {
+	port := nextPort()
+	l := echoServer(port, nil)
+	defer l.Close()
+
+	cli, err := dialEcho(port, nil)
+	if err != nil {
+		panic(err)
+		return
+	}
+	defer cli.Close()
+	cli.SetWriteDelay(true)
+	randomEchoTest(t, cli, 6*1024*1024*1024)
+}
+
+func randomEchoTest(t *testing.T, cli *UDPSession, N int64) {
 	seed := time.Now().UnixNano()
 	writerSrc := mrand.NewSource(seed)
 	readerSrc := mrand.NewSource(seed)
 
 	bytesSent := int64(0)
 	bytesReceived := int64(0)
-
-	const N = 100 * 1024 * 1024
 	maxPackLen := int(cli.kcp.mss) * IKCP_FRG_MAX
 
 	// Writer goroutine
 	go func() {
 		r := mrand.New(writerSrc)
-		lastPrint := 0
+		lastPrint := int64(0)
 		for bytesSent < N {
 			length := mrand.Intn(maxPackLen) + 1 // Random length between 1 and maxPackLen
 			if bytesSent+int64(length) > N {
@@ -409,16 +439,16 @@ func randomEchoTest(t *testing.T, cli *UDPSession) {
 				return
 			}
 			bytesSent += int64(n)
-			if percent := int(bytesSent * 100 / N); percent >= lastPrint+10 {
-				lastPrint = percent
-				t.Logf("Sent %d%% (%d/%d bytes)", percent, bytesSent, N)
+			if bytesSent-lastPrint >= 1<<28 { // print every 256MB
+				lastPrint = bytesSent
+				t.Logf("Sent %d%% (%d/%d bytes)", int(bytesSent*100/N), bytesSent, N)
 			}
 		}
 	}()
 
 	// Reader goroutine
 	r := mrand.New(readerSrc)
-	lastPrint := 0
+	lastPrint := int64(0)
 	for bytesReceived < N {
 		length := mrand.Intn(maxPackLen) + 1 // Random length between 1 and maxPackLen
 		if bytesReceived+int64(length) > N {
@@ -436,9 +466,9 @@ func randomEchoTest(t *testing.T, cli *UDPSession) {
 			}
 		}
 		bytesReceived += int64(n)
-		if percent := int(bytesReceived * 100 / N); percent >= lastPrint+10 {
-			lastPrint = percent
-			t.Logf("Received %d%% (%d/%d bytes)", percent, bytesReceived, N)
+		if bytesReceived-lastPrint >= 1<<28 { // print every 256MB
+			lastPrint = bytesReceived
+			t.Logf("Received %d%% (%d/%d bytes)", int(bytesReceived*100/N), bytesReceived, N)
 		}
 	}
 }
@@ -468,6 +498,7 @@ func randomEchoVectorTest(t *testing.T, cli *UDPSession) {
 	bytesReceived := int64(0)
 
 	const N = 100 * 1024 * 1024
+	maxPackLen := int(cli.kcp.mss) * IKCP_FRG_MAX
 
 	// Writer goroutine
 	go func() {
@@ -475,7 +506,7 @@ func randomEchoVectorTest(t *testing.T, cli *UDPSession) {
 		lastPrint := 0
 		v := make([][]byte, 2)
 		for bytesSent < N {
-			length1 := mrand.Intn(1<<20) + 1 // Random length between 1 and 1MB
+			length1 := mrand.Intn(maxPackLen) + 1 // Random length between 1 and maxPackLen
 			if bytesSent+int64(length1) > N {
 				length1 = int(N - bytesSent)
 			}
@@ -485,7 +516,7 @@ func randomEchoVectorTest(t *testing.T, cli *UDPSession) {
 				sndbuf1[i] = byte(r.Int())
 			}
 
-			length2 := mrand.Intn(1<<20) + 1 // Random length between 1 and 1MB
+			length2 := mrand.Intn(maxPackLen) + 1 // Random length between 1 and maxPackLen
 			if bytesSent+int64(length2) > N {
 				length2 = int(N - bytesSent)
 			}
@@ -521,7 +552,7 @@ func randomEchoVectorTest(t *testing.T, cli *UDPSession) {
 	r := mrand.New(readerSrc)
 	lastPrint := 0
 	for bytesReceived < N {
-		length := mrand.Intn(1<<20) + 1 // Random length between 1 and 1MB
+		length := mrand.Intn(maxPackLen) + 1 // Random length between 1 and maxPackLen
 		if bytesReceived+int64(length) > N {
 			length = int(N - bytesReceived)
 		}
@@ -705,7 +736,8 @@ func BenchmarkEchoSpeed256K(b *testing.B) {
 
 func speedclient(b *testing.B, nbytes int) {
 	port := nextPort()
-	block1, _ := NewSalsa20BlockCrypt(pass)
+	// block1, _ := NewSalsa20BlockCrypt(pass)
+	var block1 BlockCrypt = nil
 	l, err := ListenWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block1, 0, 0)
 	if err != nil {
 		panic(err)
@@ -713,7 +745,8 @@ func speedclient(b *testing.B, nbytes int) {
 	echoServerStart(l, nbytes)
 	defer l.Close()
 
-	block2, _ := NewSalsa20BlockCrypt(pass)
+	// block2, _ := NewSalsa20BlockCrypt(pass)
+	var block2 BlockCrypt = nil
 	cli, err := DialWithOptions(fmt.Sprintf("127.0.0.1:%v", port), block2, 0, 0)
 	if err != nil {
 		panic(err)
@@ -1200,4 +1233,116 @@ func TestSetLogger(t *testing.T) {
 			return
 		}
 	}
+}
+
+type largeNonceAEAD struct {
+	cipher.AEAD
+}
+
+func (*largeNonceAEAD) NonceSize() int {
+	return 1400
+}
+
+func (*largeNonceAEAD) Overhead() int {
+	return 0
+}
+
+func TestLargeNonce(t *testing.T) {
+	port := nextPort()
+
+	aead := new(largeNonceAEAD)
+	block := NewAEADCrypt(aead)
+
+	defer func() {
+		if recover() != "Overhead too large" {
+			t.Fatal("expect panic with Overhead too large")
+			return
+		}
+	}()
+
+	cli, err := dialEcho(port, block)
+	if err != nil {
+		panic(err)
+		return
+	}
+	defer cli.Close()
+}
+
+type largeOverheadAEAD struct {
+	cipher.AEAD
+}
+
+func (*largeOverheadAEAD) NonceSize() int {
+	return 0
+}
+
+func (*largeOverheadAEAD) Overhead() int {
+	return 1400
+}
+
+func TestLargeOverhead(t *testing.T) {
+	port := nextPort()
+
+	aead := new(largeOverheadAEAD)
+	block := NewAEADCrypt(aead)
+
+	defer func() {
+		if recover() != "Overhead too large" {
+			t.Fatal("expect panic with Overhead too large")
+			return
+		}
+	}()
+
+	cli, err := dialEcho(port, block)
+	if err != nil {
+		panic(err)
+		return
+	}
+	defer cli.Close()
+}
+
+type checkAllocatedAEAD struct {
+	cipher.AEAD
+}
+
+func (aead *checkAllocatedAEAD) Seal(dst, nonce, plaintext, additionalData []byte) []byte {
+	if dst == nil || cap(dst)-len(dst) < len(plaintext)+aead.AEAD.Overhead() {
+		panic("AEAD Seal will allocate new slice")
+	}
+
+	ciphertext := aead.AEAD.Seal(dst, nonce, plaintext, additionalData)
+	if &ciphertext[0] != &dst[:1][0] {
+		panic("AEAD Seal allocated new slice")
+	}
+	return ciphertext
+}
+
+func TestSealAllocated(t *testing.T) {
+	aes, err := aes.NewCipher(pass[:16])
+	if err != nil {
+		panic(err)
+		return
+	}
+
+	aesgcm, err := cipher.NewGCM(aes)
+	if err != nil {
+		panic(err)
+		return
+	}
+
+	port := nextPort()
+	block := NewAEADCrypt(&checkAllocatedAEAD{aesgcm})
+
+	l := echoServer(port, block)
+	defer l.Close()
+
+	cli, err := dialEcho(port, block)
+	if err != nil {
+		panic(err)
+		return
+	}
+	defer cli.Close()
+
+	b := make([]byte, 100*1024*1024) // 100 MB
+	cli.Write(b)
 }
