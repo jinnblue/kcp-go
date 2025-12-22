@@ -530,9 +530,7 @@ func (kcp *KCP) Send(cmd byte, buffer []byte) int {
 	}
 
 	for i := 0; i < count; i++ {
-		if size > int(kcp.mss) {
-			size = int(kcp.mss)
-		}
+		size = min(size, int(kcp.mss))
 		seg := kcp.newSegment(size)
 		seg.frg = uint8(count - i - 1)
 
@@ -543,10 +541,10 @@ func (kcp *KCP) Send(cmd byte, buffer []byte) int {
 		} else {
 			copy(seg.data, buffer[:size])
 		}
-		buffer = buffer[size:]
-		size = len(buffer)
 
 		kcp.snd_queue.Push(seg)
+		buffer = buffer[size:]
+		size = len(buffer)
 	}
 	return 0
 }
@@ -1082,20 +1080,14 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 		// rate halving, https://tools.ietf.org/html/rfc6937
 		if change > 0 {
 			inflight := kcp.snd_nxt - kcp.snd_una
-			kcp.ssthresh = inflight / 2
-			if kcp.ssthresh < IKCP_THRESH_MIN {
-				kcp.ssthresh = IKCP_THRESH_MIN
-			}
+			kcp.ssthresh = max(inflight/2, IKCP_THRESH_MIN)
 			kcp.cwnd = kcp.ssthresh + resent
 			kcp.incr = kcp.cwnd * kcp.mss
 		}
 
 		// congestion control, https://tools.ietf.org/html/rfc5681
 		if lostSegs > 0 {
-			kcp.ssthresh = cwnd / 2
-			if kcp.ssthresh < IKCP_THRESH_MIN {
-				kcp.ssthresh = IKCP_THRESH_MIN
-			}
+			kcp.ssthresh = max(cwnd/2, IKCP_THRESH_MIN)
 			kcp.cwnd = 1
 			kcp.incr = kcp.mss
 		}

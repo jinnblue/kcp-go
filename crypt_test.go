@@ -26,7 +26,6 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/md5"
 	"crypto/rand"
 	"encoding/binary"
 	"hash/crc32"
@@ -376,13 +375,11 @@ func BenchmarkAEAD_AES_128_GCM(b *testing.B) {
 	block, err := aes.NewCipher(pass[:16])
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	data := make([]byte, 1400, mtuLimit)
@@ -417,7 +414,6 @@ func BenchmarkAEAD_Chacha20_Poly1035(b *testing.B) {
 	aead, err := chacha20poly1305.New(pass[:32])
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	data := make([]byte, 1400, mtuLimit)
@@ -431,31 +427,35 @@ func BenchmarkAEAD_Chacha20_Poly1035(b *testing.B) {
 	}
 }
 
-func BenchmarkCsprngSystem(b *testing.B) {
-	data := make([]byte, md5.Size)
-	b.SetBytes(int64(len(data)))
+func TestCryptErrors(t *testing.T) {
+	invalidKey := []byte("invalid")
 
-	for b.Loop() {
-		io.ReadFull(rand.Reader, data)
+	if _, err := NewSM4BlockCrypt(invalidKey); err == nil {
+		t.Error("NewSM4BlockCrypt should fail with invalid key")
 	}
-}
-
-func BenchmarkCsprngAES128(b *testing.B) {
-	var data [aes.BlockSize]byte
-	b.SetBytes(aes.BlockSize)
-
-	r := NewEntropyAES()
-	for b.Loop() {
-		io.ReadFull(r, data[:])
+	if _, err := NewTwofishBlockCrypt(invalidKey); err == nil {
+		t.Error("NewTwofishBlockCrypt should fail with invalid key")
 	}
-}
+	if _, err := NewTripleDESBlockCrypt(invalidKey); err == nil {
+		t.Error("NewTripleDESBlockCrypt should fail with invalid key")
+	}
+	if _, err := NewCast5BlockCrypt(invalidKey); err == nil {
+		t.Error("NewCast5BlockCrypt should fail with invalid key")
+	}
+	// Blowfish supports variable key length, so "invalid" (7 bytes) might be valid.
+	// Blowfish key size: 1-56 bytes. So 7 bytes is valid.
+	// Let's try empty key or very long key.
+	if _, err := NewBlowfishBlockCrypt(nil); err == nil {
+		t.Error("NewBlowfishBlockCrypt should fail with nil key")
+	}
 
-func BenchmarkCsprngChacha8(b *testing.B) {
-	var data [8]byte
-	b.SetBytes(8)
-
-	r := NewEntropyChacha8()
-	for b.Loop() {
-		io.ReadFull(r, data[:])
+	if _, err := NewAESBlockCrypt(invalidKey); err == nil {
+		t.Error("NewAESBlockCrypt should fail with invalid key")
+	}
+	if _, err := NewTEABlockCrypt(invalidKey); err == nil {
+		t.Error("NewTEABlockCrypt should fail with invalid key")
+	}
+	if _, err := NewXTEABlockCrypt(invalidKey); err == nil {
+		t.Error("NewXTEABlockCrypt should fail with invalid key")
 	}
 }

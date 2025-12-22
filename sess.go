@@ -1161,7 +1161,7 @@ func packetDecrypt(block BlockCrypt, data []byte) []byte {
 	case *aeadCrypt:
 		nonceSize := block.NonceSize()
 		if len(data) < nonceSize+block.Overhead() {
-			break
+			return nil
 		}
 
 		nonce := data[:nonceSize]
@@ -1744,7 +1744,7 @@ func serveConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketCo
 }
 
 // Dial connects to the remote address "raddr" on the network "udp" without encryption and FEC
-func Dial(raddr string) (net.Conn, error) {
+func Dial(raddr string) (*UDPSession, error) {
 	return DialWithOptions(raddr, nil, 0, 0)
 }
 
