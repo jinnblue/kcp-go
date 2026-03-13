@@ -53,6 +53,7 @@ const (
 	fecHeaderSizePlus2 = fecHeaderSize + 2 // plus 2B data size
 	typeData           = 0xf1
 	typeParity         = 0xf2
+	typeOOB            = 0xf3
 	maxShardSets       = 3
 )
 
@@ -92,7 +93,8 @@ func (h *shardHeap) Push(x any) {
 func (h *shardHeap) Pop() any {
 	n := len(h.elements)
 	x := h.elements[n-1]
-	h.elements = h.elements[0 : n-1]
+	h.elements[n-1] = nil // clear to avoid memory leak
+	h.elements = h.elements[:n-1]
 	delete(h.marks, x.seqid())
 	return x
 }
@@ -188,6 +190,12 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 				dec.dataShards = autoDS
 				dec.parityShards = autoPS
 				dec.shardSize = autoDS + autoPS
+				// recycle old shards before creating new shardSet
+				for _, shard := range dec.shardSet {
+					for _, pkt := range shard.elements {
+						defaultBufferPool.Put(pkt)
+					}
+				}
 				dec.shardSet = make(map[uint32]*shardHeap) // empty the shard set
 				codec, err := reedsolomon.New(autoDS, autoPS)
 				if err != nil {
@@ -200,6 +208,9 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
 				dec.shouldTune = false
 				// log.Println("autotune to :", dec.dataShards, dec.parityShards)
 			}
+			// reset shouldTune flag regardless of whether parameters changed
+			// to avoid permanent blocking when detected parameters match current ones
+			dec.shouldTune = false
 		}
 		return nil
 	}
@@ -477,6 +488,18 @@ func (enc *fecEncoder) sealParity(data []byte) {
 	binary.LittleEndian.PutUint32(data, enc.next)
 	binary.LittleEndian.PutUint16(data[4:], typeParity)
 	enc.next = (enc.next + 1) % enc.paws
+}
+
+// encodeOOB encodes an out-of-band packet
+func (enc *fecEncoder) encodeOOB(b []byte) {
+	enc.sealOOB(b[enc.headerOffset:])
+	binary.LittleEndian.PutUint16(b[enc.payloadOffset:], uint16(len(b[enc.payloadOffset:])))
+}
+
+// sealOOB seals an out-of-band packet
+func (enc *fecEncoder) sealOOB(data []byte) {
+	binary.LittleEndian.PutUint32(data, uint32(0xffffffff)) // use max uint32 as OOB seqid
+	binary.LittleEndian.PutUint16(data[4:], typeOOB)
 }
 
 // skipParity skips the whole parity block by advancing the seqid

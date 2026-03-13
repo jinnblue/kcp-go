@@ -29,7 +29,6 @@ import (
 	"crypto/sha1"
 	"crypto/subtle"
 	"sync"
-	"unsafe"
 
 	"github.com/tjfoc/gmsm/sm4"
 
@@ -129,31 +128,35 @@ var _ BlockCrypt = &blockCrypt{}
 
 // blockCrypt implements BlockCrypt interface using a cipher.Block
 type blockCrypt struct {
-	enc, dec       sync.Mutex
-	encbuf, decbuf []byte // 64bit alignment enc/dec buffer
-	block          cipher.Block
+	encMu     sync.Mutex
+	decMu     sync.Mutex
+	encbuf    []byte // encryption working buffer
+	decbuf    []byte // decryption working buffer
+	block     cipher.Block
+	blockSize int // cached block size
 }
 
+//go:nosplit
 func (c *blockCrypt) Encrypt(dst, src []byte) {
-	c.enc.Lock()
-	defer c.enc.Unlock()
-
+	c.encMu.Lock()
 	encrypt(c.block, dst, src, c.encbuf)
+	c.encMu.Unlock()
 }
 
+//go:nosplit
 func (c *blockCrypt) Decrypt(dst, src []byte) {
-	c.dec.Lock()
-	defer c.dec.Unlock()
-
+	c.decMu.Lock()
 	decrypt(c.block, dst, src, c.decbuf)
+	c.decMu.Unlock()
 }
 
 func newBlockCrypt(block cipher.Block) BlockCrypt {
 	blockSize := block.BlockSize()
 	return &blockCrypt{
-		block:  block,
-		encbuf: make([]byte, blockSize),
-		decbuf: make([]byte, 2*blockSize),
+		block:     block,
+		blockSize: blockSize,
+		encbuf:    make([]byte, blockSize),
+		decbuf:    make([]byte, 2*blockSize),
 	}
 }
 
@@ -168,13 +171,26 @@ func NewSalsa20BlockCrypt(key []byte) (BlockCrypt, error) {
 	return c, nil
 }
 
+//go:nosplit
 func (c *salsa20BlockCrypt) Encrypt(dst, src []byte) {
+	if len(src) < 8 {
+		return
+	}
 	salsa20.XORKeyStream(dst[8:], src[8:], src[:8], &c.key)
-	copy(dst[:8], src[:8])
+	if &dst[0] != &src[0] {
+		copy(dst[:8], src[:8])
+	}
 }
+
+//go:nosplit
 func (c *salsa20BlockCrypt) Decrypt(dst, src []byte) {
+	if len(src) < 8 {
+		return
+	}
 	salsa20.XORKeyStream(dst[8:], src[8:], src[:8], &c.key)
-	copy(dst[:8], src[:8])
+	if &dst[0] != &src[0] {
+		copy(dst[:8], src[:8])
+	}
 }
 
 // NewSM4BlockCrypt https://github.com/tjfoc/gmsm/tree/master/sm4
@@ -260,8 +276,18 @@ func NewSimpleXORBlockCrypt(key []byte) (BlockCrypt, error) {
 	return c, nil
 }
 
-func (c *simpleXORBlockCrypt) Encrypt(dst, src []byte) { subtle.XORBytes(dst, src, c.xortbl) }
-func (c *simpleXORBlockCrypt) Decrypt(dst, src []byte) { subtle.XORBytes(dst, src, c.xortbl) }
+func (c *simpleXORBlockCrypt) Encrypt(dst, src []byte) {
+	if len(src) == 0 {
+		return
+	}
+	subtle.XORBytes(dst, src, c.xortbl)
+}
+func (c *simpleXORBlockCrypt) Decrypt(dst, src []byte) {
+	if len(src) == 0 {
+		return
+	}
+	subtle.XORBytes(dst, src, c.xortbl)
+}
 
 type noneBlockCrypt struct{}
 
@@ -270,8 +296,25 @@ func NewNoneBlockCrypt(key []byte) (BlockCrypt, error) {
 	return new(noneBlockCrypt), nil
 }
 
-func (c *noneBlockCrypt) Encrypt(dst, src []byte) { copy(dst, src) }
-func (c *noneBlockCrypt) Decrypt(dst, src []byte) { copy(dst, src) }
+//go:nosplit
+func (c *noneBlockCrypt) Encrypt(dst, src []byte) {
+	if len(src) == 0 {
+		return
+	}
+	if &dst[0] != &src[0] {
+		copy(dst, src)
+	}
+}
+
+//go:nosplit
+func (c *noneBlockCrypt) Decrypt(dst, src []byte) {
+	if len(src) == 0 {
+		return
+	}
+	if &dst[0] != &src[0] {
+		copy(dst, src)
+	}
+}
 
 // packet encryption with local CFB mode
 func encrypt(block cipher.Block, dst, src, buf []byte) {
@@ -289,76 +332,75 @@ func encrypt(block cipher.Block, dst, src, buf []byte) {
 func encrypt8(block cipher.Block, dst, src, buf []byte) {
 	tbl := buf[:8]
 	block.Encrypt(tbl, initialVector)
-	n := len(src) / 8
+	n := len(src) >> 3 // len(src) / 8
 	base := 0
-	repeat := n / 8
-	left := n % 8
-	ptr_tbl := (*uint64)(unsafe.Pointer(&tbl[0]))
+	repeat := n >> 3 // n / 8
+	left := n & 7    // n % 8
 
 	for range repeat {
 		s := src[base:][0:64]
 		d := dst[base:][0:64]
 		// 1
-		*(*uint64)(unsafe.Pointer(&d[0])) = *(*uint64)(unsafe.Pointer(&s[0])) ^ *ptr_tbl
+		subtle.XORBytes(d[0:8], s[0:8], tbl)
 		block.Encrypt(tbl, d[0:8])
 		// 2
-		*(*uint64)(unsafe.Pointer(&d[8])) = *(*uint64)(unsafe.Pointer(&s[8])) ^ *ptr_tbl
+		subtle.XORBytes(d[8:16], s[8:16], tbl)
 		block.Encrypt(tbl, d[8:16])
 		// 3
-		*(*uint64)(unsafe.Pointer(&d[16])) = *(*uint64)(unsafe.Pointer(&s[16])) ^ *ptr_tbl
+		subtle.XORBytes(d[16:24], s[16:24], tbl)
 		block.Encrypt(tbl, d[16:24])
 		// 4
-		*(*uint64)(unsafe.Pointer(&d[24])) = *(*uint64)(unsafe.Pointer(&s[24])) ^ *ptr_tbl
+		subtle.XORBytes(d[24:32], s[24:32], tbl)
 		block.Encrypt(tbl, d[24:32])
 		// 5
-		*(*uint64)(unsafe.Pointer(&d[32])) = *(*uint64)(unsafe.Pointer(&s[32])) ^ *ptr_tbl
+		subtle.XORBytes(d[32:40], s[32:40], tbl)
 		block.Encrypt(tbl, d[32:40])
 		// 6
-		*(*uint64)(unsafe.Pointer(&d[40])) = *(*uint64)(unsafe.Pointer(&s[40])) ^ *ptr_tbl
+		subtle.XORBytes(d[40:48], s[40:48], tbl)
 		block.Encrypt(tbl, d[40:48])
 		// 7
-		*(*uint64)(unsafe.Pointer(&d[48])) = *(*uint64)(unsafe.Pointer(&s[48])) ^ *ptr_tbl
+		subtle.XORBytes(d[48:56], s[48:56], tbl)
 		block.Encrypt(tbl, d[48:56])
 		// 8
-		*(*uint64)(unsafe.Pointer(&d[56])) = *(*uint64)(unsafe.Pointer(&s[56])) ^ *ptr_tbl
+		subtle.XORBytes(d[56:64], s[56:64], tbl)
 		block.Encrypt(tbl, d[56:64])
 		base += 64
 	}
 
 	switch left {
 	case 7:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
-		block.Encrypt(tbl, dst[base:])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
+		block.Encrypt(tbl, dst[base:base+8])
 		base += 8
 		fallthrough
 	case 6:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
-		block.Encrypt(tbl, dst[base:])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
+		block.Encrypt(tbl, dst[base:base+8])
 		base += 8
 		fallthrough
 	case 5:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
-		block.Encrypt(tbl, dst[base:])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
+		block.Encrypt(tbl, dst[base:base+8])
 		base += 8
 		fallthrough
 	case 4:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
-		block.Encrypt(tbl, dst[base:])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
+		block.Encrypt(tbl, dst[base:base+8])
 		base += 8
 		fallthrough
 	case 3:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
-		block.Encrypt(tbl, dst[base:])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
+		block.Encrypt(tbl, dst[base:base+8])
 		base += 8
 		fallthrough
 	case 2:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
-		block.Encrypt(tbl, dst[base:])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
+		block.Encrypt(tbl, dst[base:base+8])
 		base += 8
 		fallthrough
 	case 1:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
-		block.Encrypt(tbl, dst[base:])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
+		block.Encrypt(tbl, dst[base:base+8])
 		base += 8
 		fallthrough
 	case 0:
@@ -370,10 +412,10 @@ func encrypt8(block cipher.Block, dst, src, buf []byte) {
 func encrypt16(block cipher.Block, dst, src, buf []byte) {
 	tbl := buf[:16]
 	block.Encrypt(tbl, initialVector)
-	n := len(src) / 16
+	n := len(src) >> 4 // len(src) / 16
 	base := 0
-	repeat := n / 8
-	left := n % 8
+	repeat := n >> 3 // n / 8
+	left := n & 7    // n % 8
 	for range repeat {
 		s := src[base:][0:128]
 		d := dst[base:][0:128]
@@ -457,17 +499,15 @@ func decrypt(block cipher.Block, dst, src, buf []byte) {
 	}
 }
 
-// decrypt 8 bytes block, all byte slices are supposed to be 64bit aligned
+// decrypt 8 bytes block
 func decrypt8(block cipher.Block, dst, src, buf []byte) {
 	tbl := buf[0:8]
 	next := buf[8:16]
 	block.Encrypt(tbl, initialVector)
-	n := len(src) / 8
+	n := len(src) >> 3 // len(src) / 8
 	base := 0
-	repeat := n / 8
-	left := n % 8
-	ptr_tbl := (*uint64)(unsafe.Pointer(&tbl[0]))
-	ptr_next := (*uint64)(unsafe.Pointer(&next[0]))
+	repeat := n >> 3 // n / 8
+	left := n & 7    // n % 8
 
 	// loop unrolling to relieve data dependency
 	for range repeat {
@@ -475,71 +515,71 @@ func decrypt8(block cipher.Block, dst, src, buf []byte) {
 		d := dst[base:][0:64]
 		// 1
 		block.Encrypt(next, s[0:8])
-		*(*uint64)(unsafe.Pointer(&d[0])) = *(*uint64)(unsafe.Pointer(&s[0])) ^ *ptr_tbl
+		subtle.XORBytes(d[0:8], s[0:8], tbl)
 		// 2
 		block.Encrypt(tbl, s[8:16])
-		*(*uint64)(unsafe.Pointer(&d[8])) = *(*uint64)(unsafe.Pointer(&s[8])) ^ *ptr_next
+		subtle.XORBytes(d[8:16], s[8:16], next)
 		// 3
 		block.Encrypt(next, s[16:24])
-		*(*uint64)(unsafe.Pointer(&d[16])) = *(*uint64)(unsafe.Pointer(&s[16])) ^ *ptr_tbl
+		subtle.XORBytes(d[16:24], s[16:24], tbl)
 		// 4
 		block.Encrypt(tbl, s[24:32])
-		*(*uint64)(unsafe.Pointer(&d[24])) = *(*uint64)(unsafe.Pointer(&s[24])) ^ *ptr_next
+		subtle.XORBytes(d[24:32], s[24:32], next)
 		// 5
 		block.Encrypt(next, s[32:40])
-		*(*uint64)(unsafe.Pointer(&d[32])) = *(*uint64)(unsafe.Pointer(&s[32])) ^ *ptr_tbl
+		subtle.XORBytes(d[32:40], s[32:40], tbl)
 		// 6
 		block.Encrypt(tbl, s[40:48])
-		*(*uint64)(unsafe.Pointer(&d[40])) = *(*uint64)(unsafe.Pointer(&s[40])) ^ *ptr_next
+		subtle.XORBytes(d[40:48], s[40:48], next)
 		// 7
 		block.Encrypt(next, s[48:56])
-		*(*uint64)(unsafe.Pointer(&d[48])) = *(*uint64)(unsafe.Pointer(&s[48])) ^ *ptr_tbl
+		subtle.XORBytes(d[48:56], s[48:56], tbl)
 		// 8
 		block.Encrypt(tbl, s[56:64])
-		*(*uint64)(unsafe.Pointer(&d[56])) = *(*uint64)(unsafe.Pointer(&s[56])) ^ *ptr_next
+		subtle.XORBytes(d[56:64], s[56:64], next)
 		base += 64
 	}
 
 	switch left {
 	case 7:
-		block.Encrypt(next, src[base:])
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *(*uint64)(unsafe.Pointer(&tbl[0]))
+		block.Encrypt(next, src[base:base+8])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
 		tbl, next = next, tbl
 		base += 8
 		fallthrough
 	case 6:
-		block.Encrypt(next, src[base:])
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *(*uint64)(unsafe.Pointer(&tbl[0]))
+		block.Encrypt(next, src[base:base+8])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
 		tbl, next = next, tbl
 		base += 8
 		fallthrough
 	case 5:
-		block.Encrypt(next, src[base:])
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *(*uint64)(unsafe.Pointer(&tbl[0]))
+		block.Encrypt(next, src[base:base+8])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
 		tbl, next = next, tbl
 		base += 8
 		fallthrough
 	case 4:
-		block.Encrypt(next, src[base:])
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *(*uint64)(unsafe.Pointer(&tbl[0]))
+		block.Encrypt(next, src[base:base+8])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
 		tbl, next = next, tbl
 		base += 8
 		fallthrough
 	case 3:
-		block.Encrypt(next, src[base:])
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *(*uint64)(unsafe.Pointer(&tbl[0]))
+		block.Encrypt(next, src[base:base+8])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
 		tbl, next = next, tbl
 		base += 8
 		fallthrough
 	case 2:
-		block.Encrypt(next, src[base:])
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *(*uint64)(unsafe.Pointer(&tbl[0]))
+		block.Encrypt(next, src[base:base+8])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
 		tbl, next = next, tbl
 		base += 8
 		fallthrough
 	case 1:
-		block.Encrypt(next, src[base:])
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *(*uint64)(unsafe.Pointer(&tbl[0]))
+		block.Encrypt(next, src[base:base+8])
+		subtle.XORBytes(dst[base:base+8], src[base:base+8], tbl)
 		tbl, next = next, tbl
 		base += 8
 		fallthrough
@@ -552,10 +592,10 @@ func decrypt16(block cipher.Block, dst, src, buf []byte) {
 	tbl := buf[0:16]
 	next := buf[16:32]
 	block.Encrypt(tbl, initialVector)
-	n := len(src) / 16
+	n := len(src) >> 4 // len(src) / 16
 	base := 0
-	repeat := n / 8
-	left := n % 8
+	repeat := n >> 3 // n / 8
+	left := n & 7    // n % 8
 
 	// loop unrolling to relieve data dependency
 	for range repeat {

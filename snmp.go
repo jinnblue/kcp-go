@@ -59,6 +59,7 @@ type Snmp struct {
 	RingBufferSndQueue  uint64 // Len of segments in send queue ring buffer
 	RingBufferRcvQueue  uint64 // Len of segments in receive queue ring buffer
 	RingBufferSndBuffer uint64 // Len of segments in send buffer ring buffer
+	OOBPackets          uint64 // number of OOB packets received
 }
 
 func newSnmp() *Snmp {
@@ -97,6 +98,7 @@ func (s *Snmp) Header() []string {
 		"RingBufferSndQueue",
 		"RingBufferRcvQueue",
 		"RingBufferSndBuffer",
+		"OOBPackets",
 	}
 }
 
@@ -134,6 +136,7 @@ func (s *Snmp) ToSlice() []string {
 		strconv.FormatUint(snmp.RingBufferSndQueue, 10),
 		strconv.FormatUint(snmp.RingBufferRcvQueue, 10),
 		strconv.FormatUint(snmp.RingBufferSndBuffer, 10),
+		strconv.FormatUint(snmp.OOBPackets, 10),
 	}
 }
 
@@ -170,6 +173,7 @@ func (s *Snmp) Copy() *Snmp {
 	d.RingBufferSndQueue = atomic.LoadUint64(&s.RingBufferSndQueue)
 	d.RingBufferRcvQueue = atomic.LoadUint64(&s.RingBufferRcvQueue)
 	d.RingBufferSndBuffer = atomic.LoadUint64(&s.RingBufferSndBuffer)
+	d.OOBPackets = atomic.LoadUint64(&s.OOBPackets)
 	return d
 }
 
@@ -205,6 +209,7 @@ func (s *Snmp) Reset() {
 	atomic.StoreUint64(&s.RingBufferSndQueue, 0)
 	atomic.StoreUint64(&s.RingBufferRcvQueue, 0)
 	atomic.StoreUint64(&s.RingBufferSndBuffer, 0)
+	atomic.StoreUint64(&s.OOBPackets, 0)
 }
 
 // DefaultSnmp is the global KCP connection statistics collector
