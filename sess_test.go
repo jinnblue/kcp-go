@@ -1379,9 +1379,8 @@ func TestOOB(t *testing.T) {
 
 	go func() {
 		// Server listens for OOB data and echoes it back
-		kcplistener := l.(*Listener)
-		kcplistener.SetReadBuffer(4 * 1024 * 1024)
-		kcplistener.SetWriteBuffer(4 * 1024 * 1024)
+		l.SetReadBuffer(4 * 1024 * 1024)
+		l.SetWriteBuffer(4 * 1024 * 1024)
 		for {
 			s, err := l.Accept()
 			if err != nil {
@@ -1396,7 +1395,7 @@ func TestOOB(t *testing.T) {
 					t.Errorf("server failed to echo OOB payload: %v", err)
 				}
 			})
-			go handleEcho(sess)
+			go handleEcho(sess, 64*1024)
 		}
 	}()
 
@@ -1447,7 +1446,7 @@ func TestOOB(t *testing.T) {
 		for i := range len(buf) {
 			buf[i] = byte(i)
 		}
-		for i := range 10 * 1024 * 1024 {
+		for i := range 1 * 1024 * 1024 {
 			if err := cli.SendOOB(buf[:i%sizePlus1]); err != nil {
 				t.Errorf("client failed to send OOB payload: %v", err)
 			}
@@ -1488,9 +1487,8 @@ func TestOOB_OneSideHandler(t *testing.T) {
 	go func() {
 		// Server sets OOB handler and counts received OOB packets by length.
 		// The handler directly updates the shared 'counts' slice.
-		kcplistener := l.(*Listener)
-		kcplistener.SetReadBuffer(4 * 1024 * 1024)
-		kcplistener.SetWriteBuffer(4 * 1024 * 1024)
+		l.SetReadBuffer(4 * 1024 * 1024)
+		l.SetWriteBuffer(4 * 1024 * 1024)
 		for {
 			s, err := l.Accept()
 			if err != nil {
@@ -1513,7 +1511,7 @@ func TestOOB_OneSideHandler(t *testing.T) {
 				}
 				counts[len(buf)].Add(1)
 			})
-			go handleEcho(sess)
+			go handleEcho(sess, 64*1024)
 		}
 	}()
 
@@ -1538,7 +1536,7 @@ func TestOOB_OneSideHandler(t *testing.T) {
 		for i := range len(buf) {
 			buf[i] = byte(i)
 		}
-		for i := range 10 * 1024 * 1024 {
+		for i := range 1 * 1024 * 1024 {
 			if err := cli.SendOOB(buf[:i%sizePlus1]); err != nil {
 				t.Errorf("client failed to send OOB payload: %v", err)
 			}

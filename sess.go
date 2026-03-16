@@ -1124,6 +1124,9 @@ func (s *UDPSession) SendOOB(data []byte) error {
 	// Allocate buffer with reserved header space.
 	// s.headerSize includes the space needed by the FEC encoder.
 	buf := defaultBufferPool.Get()[:size+s.headerSize]
+	// set channel and cookie
+	buf[channelOffset] = channelReliable
+	binary.LittleEndian.PutUint32(buf[cookieOffset:mirrorHeadSize], s.cookie.Load())
 	// Encode conversation ID.
 	binary.LittleEndian.PutUint32(buf[s.headerSize:], s.kcp.conv)
 
@@ -1307,8 +1310,6 @@ func packetDecrypt(block BlockCrypt, data []byte) []byte {
 
 		return data
 	}
-
-	return nil
 }
 
 // packet input pipeline:
@@ -1555,7 +1556,7 @@ func (l *Listener) mirrorPacketInput(data []byte, addr net.Addr) {
 
 func (l *Listener) mirrorReliableInput(sess *UDPSession, data []byte, addr net.Addr, msgCookie uint32) {
 	data = packetDecrypt(l.block, data)
-	if len(data) < IKCP_OVERHEAD {
+	if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
 		return
 	}
 
@@ -1631,7 +1632,8 @@ func (l *Listener) parseHeader(data []byte) (conv uint32, sn uint32, cmd byte, c
 	cmd = cmdKcpOriginal
 	convRecovered = false
 	fecFlag := binary.LittleEndian.Uint16(data[4:])
-	if fecFlag == typeData || fecFlag == typeParity { // 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
+	switch fecFlag {
+	case typeData, typeParity: // 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
 		// packet with FEC
 		if fecFlag == typeData {
 			headerLen := fecHeaderSizePlus2 + IKCP_OVERHEAD
@@ -1644,7 +1646,10 @@ func (l *Listener) parseHeader(data []byte) (conv uint32, sn uint32, cmd byte, c
 			}
 			convRecovered = true
 		}
-	} else {
+	case typeOOB:
+		conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
+		convRecovered = true
+	default:
 		// packet without FEC
 		conv = binary.LittleEndian.Uint32(data)
 		sn = binary.LittleEndian.Uint32(data[IKCP_SN_OFFSET:])
