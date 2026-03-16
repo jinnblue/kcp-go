@@ -94,6 +94,20 @@ const (
 	IKCP_LOG_ALL        = IKCP_LOG_OUTPUT_ALL | IKCP_LOG_INPUT_ALL | IKCP_LOG_SEND | IKCP_LOG_RECV | IKCP_LOG_READ | IKCP_LOG_WRITE | IKCP_LOG_DEADLINK
 )
 
+type RecycleMask int32
+
+const (
+	IKCP_RM_SND_QUEUE RecycleMask = 1 << iota
+	IKCP_RM_SND_BUF
+	IKCP_RM_RCV_QUEUE
+	IKCP_RM_RCV_BUF
+)
+
+const (
+	IKCP_RM_CLOSE RecycleMask = IKCP_RM_SND_QUEUE | IKCP_RM_SND_BUF | IKCP_RM_RCV_BUF
+	IKCP_RM_ALL               = IKCP_RM_CLOSE | IKCP_RM_RCV_QUEUE
+)
+
 // monotonic reference time point
 var refTime time.Time = time.Now()
 
@@ -314,6 +328,39 @@ func (kcp *KCP) recycleSegment(seg *segment) {
 	if seg.data != nil {
 		defaultBufferPool.Put(seg.data)
 		seg.data = nil
+	}
+}
+
+// recycleBuffer returns all buffered segment data from every KCP queue back to
+// the buffer pool. Must be called while holding the session mutex (s.mu) to
+// prevent data races with concurrent flush/input operations.
+func (kcp *KCP) recycleBuffer(mask RecycleMask) {
+	if mask&IKCP_RM_SND_QUEUE != 0 {
+		for seg := range kcp.snd_queue.ForEach {
+			kcp.recycleSegment(seg)
+		}
+		kcp.snd_queue.Clear()
+	}
+
+	if mask&IKCP_RM_SND_BUF != 0 {
+		for seg := range kcp.snd_buf.ForEach {
+			kcp.recycleSegment(seg)
+		}
+		kcp.snd_buf.Clear()
+	}
+
+	if mask&IKCP_RM_RCV_QUEUE != 0 {
+		for seg := range kcp.rcv_queue.ForEach {
+			kcp.recycleSegment(seg)
+		}
+		kcp.rcv_queue.Clear()
+	}
+
+	if mask&IKCP_RM_RCV_BUF != 0 {
+		for kcp.rcv_buf.Len() > 0 {
+			seg := kcp.rcv_buf.Pop()
+			kcp.recycleSegment(&seg)
+		}
 	}
 }
 

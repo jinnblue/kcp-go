@@ -628,6 +628,8 @@ func (s *UDPSession) closeWithType(ct ClosedType, needlock bool) (err error) {
 	s.state.Store(stateDisconnected)
 	atomic.AddUint64(&DefaultSnmp.CurrEstab, ^uint64(0))
 
+	s.recycleBuffer(needlock, IKCP_RM_CLOSE)
+
 	if s.handler != nil {
 		s.handler.OnDisconnected(s, ct)
 		s.handler = nil
@@ -643,6 +645,24 @@ func (s *UDPSession) closeWithType(ct ClosedType, needlock bool) (err error) {
 	}
 
 	return nil
+}
+
+// recycleBuffer recycle all KCP segment buffers and drain udpRecvQueue back to the pool.
+// Lock mu to wait for any in-progress kcp.flush() to complete first.
+func (s *UDPSession) recycleBuffer(needlock bool, mask RecycleMask) {
+	if needlock {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+	}
+
+	s.kcp.recycleBuffer(mask)
+
+	for d := range s.udpRecvQueue.ForEach {
+		if d.data != nil {
+			defaultBufferPool.Put(d.data)
+		}
+	}
+	s.udpRecvQueue.Clear()
 }
 
 func (s *UDPSession) flushKcp(flushType FlushType, needlock bool) {
@@ -1460,11 +1480,7 @@ func (s *UDPSession) kcpHardReset() {
 		s.kcp.snd_una = 0
 		s.kcp.snd_nxt = 0
 		s.kcp.rcv_nxt = 0
-		// clear queue
-		s.kcp.snd_queue.Clear()
-		s.kcp.snd_buf.Clear()
-		s.kcp.rcv_queue.Clear()
-		s.kcp.rcv_buf = newMinheap(int(s.kcp.rcv_wnd))
+		s.recycleBuffer(false, IKCP_RM_ALL)
 		// clear ack list
 		s.kcp.acklist = s.kcp.acklist[:0]
 	}
