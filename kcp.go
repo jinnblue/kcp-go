@@ -46,7 +46,7 @@ const (
 	IKCP_ACK_FAST    = 3
 	IKCP_INTERVAL    = 100
 	IKCP_OVERHEAD    = 24
-	IKCP_DEADLINK    = 12 // dead link 5~8s
+	IKCP_DEADLINK    = 20 // dead link
 	IKCP_THRESH_INIT = 2
 	IKCP_THRESH_MIN  = 2
 	IKCP_PROBE_INIT  = 500    // 500ms to probe window size
@@ -961,9 +961,12 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				earlyRetransSegs++
 			} else if _itimediff(current, segment.resendts) >= 0 { // RTO
 				needsend = true
-				if kcp.nodelay == 0 {
-					segment.rto += kcp.rx_rto
-				} else {
+				switch kcp.nodelay {
+				case 0:
+					segment.rto += max(segment.rto, kcp.rx_rto)
+				case 1:
+					segment.rto += segment.rto / 2
+				default:
 					segment.rto += kcp.rx_rto / 2
 				}
 				segment.fastack = 0
@@ -1164,6 +1167,14 @@ func (kcp *KCP) NoDelay(nodelay, interval, resend, nc int) int {
 	}
 	if nc >= 0 {
 		kcp.nocwnd = int32(nc)
+	}
+	return 0
+}
+
+// DeadLink sets the maximum retransmits (aka dead_link)
+func (kcp *KCP) DeadLink(deadlink uint32) int {
+	if deadlink > 0 {
+		kcp.dead_link = deadlink
 	}
 	return 0
 }

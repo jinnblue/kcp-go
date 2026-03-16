@@ -735,6 +735,13 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 	s.mu.Unlock()
 }
 
+// SetMaxRetransmits sets the maximum retransmits (aka dead_link)
+func (s *UDPSession) SetMaxRetransmits(mr int) {
+	s.mu.Lock()
+	s.kcp.DeadLink(uint32(mr))
+	s.mu.Unlock()
+}
+
 // SetDSCP sets the 6bit DSCP field in IPv4 header, or 8bit Traffic Class in IPv6 header.
 //
 // if the underlying connection has implemented `func SetDSCP(int) error`, SetDSCP() will invoke
