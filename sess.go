@@ -191,6 +191,7 @@ type (
 
 		// settings
 		remote     net.Addr     // remote peer address
+		remoteAddr string       // cache addr.String() once to avoid repeated allocations via net.JoinHostPort
 		rd         atomic.Value // read deadline
 		wd         atomic.Value // write deadline
 		headerSize int          // the header size additional to a KCP frame
@@ -264,6 +265,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.chSocketWriteError = make(chan struct{})
 	sess.chPostProcessing = make(chan sendRequest, devBacklog)
 	sess.remote = remote
+	sess.remoteAddr = remote.String()
 	sess.conn = conn
 	sess.ownConn = ownConn
 	sess.l = l
@@ -636,7 +638,7 @@ func (s *UDPSession) closeWithType(ct ClosedType, needlock bool) (err error) {
 	}
 
 	if s.l != nil { // belongs to listener
-		s.l.closeSession(s.remote)
+		s.l.closeSession(s.remoteAddr)
 		return nil
 	}
 
@@ -1270,11 +1272,11 @@ func (s *UDPSession) mirrorReliableInput(data []byte) []byte {
 				s.handler.OnPing(s, s.kcp.rx_srtt)
 			}
 			if s.l != nil {
-				s.l.debugLog(LISTEN_LOG_RDP_PING, "addr", s.remote.String(), "conv", s.kcp.conv, "cookie", s.cookie.Load())
+				s.l.debugLog(LISTEN_LOG_RDP_PING, "addr", s.remoteAddr, "conv", s.kcp.conv, "cookie", s.cookie.Load())
 			}
 		} else if cmd == cmdReliableData {
 			if s.l != nil {
-				s.l.debugLog(LISTEN_LOG_RDP_DATA, "addr", s.remote.String(), "conv", s.kcp.conv, "cookie", s.cookie.Load(), "datalen", len(data[mirrorCmdSize:]))
+				s.l.debugLog(LISTEN_LOG_RDP_DATA, "addr", s.remoteAddr, "conv", s.kcp.conv, "cookie", s.cookie.Load(), "datalen", len(data[mirrorCmdSize:]))
 			}
 			return data[mirrorCmdSize:]
 		} else if cmd == cmdReliableHello {
@@ -1554,14 +1556,17 @@ type ListenerHandler interface {
 }
 
 // packet input stage
-func (l *Listener) mirrorPacketInput(data []byte, addr net.Addr) {
+func (l *Listener) mirrorPacketInput(data []byte, from net.Addr) {
 	if len(data) < mirrorPacketSize {
 		atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 		return
 	}
 
+	// cache from addr string once to avoid repeated allocations via net.JoinHostPort
+	fromAddr := from.String()
+
 	l.sessionLock.RLock()
-	sess := l.sessions[addr.String()]
+	sess := l.sessions[fromAddr]
 	l.sessionLock.RUnlock()
 
 	channel := data[channelOffset]
@@ -1569,15 +1574,15 @@ func (l *Listener) mirrorPacketInput(data []byte, addr net.Addr) {
 	data = data[mirrorHeadSize:]
 	switch channel {
 	case channelReliable:
-		l.mirrorReliableInput(sess, data, addr, msgCookie)
+		l.mirrorReliableInput(sess, data, from, fromAddr, msgCookie)
 	case channelUnreliable:
-		l.mirrorUnreliableInput(sess, data, addr, msgCookie)
+		l.mirrorUnreliableInput(sess, data, from, fromAddr, msgCookie)
 	default:
 		atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 	}
 }
 
-func (l *Listener) mirrorReliableInput(sess *UDPSession, data []byte, addr net.Addr, msgCookie uint32) {
+func (l *Listener) mirrorReliableInput(sess *UDPSession, data []byte, from net.Addr, fromAddr string, msgCookie uint32) {
 	data = packetDecrypt(l.block, data)
 	if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
 		return
@@ -1585,12 +1590,12 @@ func (l *Listener) mirrorReliableInput(sess *UDPSession, data []byte, addr net.A
 
 	// cmd is after KCP Header (byte 24 of payload)
 	conv, sn, cmd, convRecovered := l.parseHeader(data)
-	l.debugLog(LISTEN_LOG_RDP_INPUT, "addr", addr.String(), "cookie", msgCookie,
+	l.debugLog(LISTEN_LOG_RDP_INPUT, "addr", fromAddr, "cookie", msgCookie,
 		"conv", conv, "sn", sn, "cmd", cmd, "convRecovered", convRecovered, "datalen", len(data))
 
 	if sess != nil { // existing connection
 		if msgCookie != sess.cookie.Load() {
-			l.debugLog(LISTEN_LOG_RDP_DROP, "addr", addr.String(), "cookie", msgCookie, "sess_cookie", sess.cookie.Load(), "conv", conv, "sn", sn, "cmd", cmd, "datalen", len(data))
+			l.debugLog(LISTEN_LOG_RDP_DROP, "addr", fromAddr, "cookie", msgCookie, "sess_cookie", sess.cookie.Load(), "conv", conv, "sn", sn, "cmd", cmd, "datalen", len(data))
 			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 			return
 		}
@@ -1605,17 +1610,17 @@ func (l *Listener) mirrorReliableInput(sess *UDPSession, data []byte, addr net.A
 		}
 		var cookie uint32
 		if l.handler != nil {
-			if cookie = l.handler.OnConnect(addr, conv); cookie == 0 {
+			if cookie = l.handler.OnConnect(from, conv); cookie == 0 {
 				return
 			}
 		}
-		l.debugLog(LISTEN_LOG_RDP_HELLO, "addr", addr.String(), "sess_cookie", cookie, "conv", conv, "sn", sn)
+		l.debugLog(LISTEN_LOG_RDP_HELLO, "addr", fromAddr, "sess_cookie", cookie, "conv", conv, "sn", sn)
 		if len(l.chAccepts) < cap(l.chAccepts) { // do not let the new sessions overwhelm accept queue
-			sess = newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, false, addr, l.block)
+			sess = newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, false, from, l.block)
 			sess.SetCookie(cookie)
 			sess.kcpInput(data)
 			l.sessionLock.Lock()
-			l.sessions[addr.String()] = sess
+			l.sessions[fromAddr] = sess
 			l.sessionLock.Unlock()
 			l.chAccepts <- sess
 		}
@@ -1623,9 +1628,9 @@ func (l *Listener) mirrorReliableInput(sess *UDPSession, data []byte, addr net.A
 	}
 }
 
-func (l *Listener) mirrorUnreliableInput(sess *UDPSession, data []byte, addr net.Addr, msgCookie uint32) {
+func (l *Listener) mirrorUnreliableInput(sess *UDPSession, data []byte, _ net.Addr, fromAddr string, msgCookie uint32) {
 	cmd := data[cmdOffset]
-	l.debugLog(LISTEN_LOG_UDP_INPUT, "addr", addr.String(), "cookie", msgCookie, "cmd", cmd, "datalen", len(data))
+	l.debugLog(LISTEN_LOG_UDP_INPUT, "addr", fromAddr, "cookie", msgCookie, "cmd", cmd, "datalen", len(data))
 
 	if sess == nil {
 		return
@@ -1634,7 +1639,7 @@ func (l *Listener) mirrorUnreliableInput(sess *UDPSession, data []byte, addr net
 		return
 	}
 	if msgCookie != sess.cookie.Load() {
-		l.debugLog(LISTEN_LOG_UDP_DROP, "addr", addr.String(), "cookie", msgCookie, "sess_cookie", sess.cookie.Load(), "conv", sess.kcp.conv, "cmd", cmd, "datalen", len(data))
+		l.debugLog(LISTEN_LOG_UDP_DROP, "addr", fromAddr, "cookie", msgCookie, "sess_cookie", sess.cookie.Load(), "conv", sess.kcp.conv, "cmd", cmd, "datalen", len(data))
 		atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 		return
 	}
@@ -1829,13 +1834,11 @@ func (l *Listener) Control(f func(conn net.PacketConn) error) error {
 }
 
 // closeSession notify the listener that a session has closed
-func (l *Listener) closeSession(remote net.Addr) bool {
-	addr := remote.String()
-
+func (l *Listener) closeSession(remoteAddr string) bool {
 	l.sessionLock.Lock()
-	sess, ok := l.sessions[addr]
+	sess, ok := l.sessions[remoteAddr]
 	if ok {
-		delete(l.sessions, addr)
+		delete(l.sessions, remoteAddr)
 		l.sessionLock.Unlock() // unlock then notify handler to avoid deadlock
 		if l.handler != nil {
 			l.handler.OnDisconnect(sess)

@@ -44,6 +44,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 	"golang.org/x/crypto/pbkdf2"
 )
 
@@ -857,7 +858,7 @@ func TestListenerClose(t *testing.T) {
 
 	l.Close()
 	fakeaddr, _ := net.ResolveUDPAddr("udp6", "127.0.0.1:1111")
-	if l.closeSession(fakeaddr) {
+	if l.closeSession(fakeaddr.String()) {
 		t.Fail()
 		return
 	}
@@ -1650,4 +1651,28 @@ func TestSendOOB_Errors(t *testing.T) {
 	if err == nil || err.Error() != "OOB payload too large" {
 		t.Errorf("expected 'OOB payload too large', got %v", err)
 	}
+}
+
+func BenchmarkAddr_StringCompare(b *testing.B) {
+	addr, _ := net.ResolveUDPAddr("udp4", "127.0.0.1:1111")
+	addrStr := addr.String()
+
+	var ret bool
+	for b.Loop() {
+		ret = addr.String() == addrStr
+	}
+	assert.True(b, ret, "addr.String() should equal cmpStr")
+}
+
+func BenchmarkAddr_SameUDPAddr(b *testing.B) {
+	var addr net.Addr
+	src, _ := net.ResolveUDPAddr("udp4", "127.0.0.1:1111")
+	addr, _ = net.ResolveUDPAddr("udp4", "127.0.0.1:1111")
+
+	var ret bool
+	for b.Loop() {
+		udp, ok := addr.(*net.UDPAddr)
+		ret = ok && sameUDPAddr(src, udp)
+	}
+	assert.True(b, ret, "addr should be same as src")
 }
